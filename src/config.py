@@ -15,7 +15,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 APP_NAME = "SENSEX Fib Breakout"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 BROKER = "Zerodha"
 
 IST = ZoneInfo("Asia/Kolkata")
@@ -59,10 +59,15 @@ DEFAULT_SETTINGS = {
     "premium_max": 600.0,
     "premium_target": 500.0,         # pick the premium closest to this
     "strike_window": 4000,           # +/- points around spot to scan
+    "selection_shortlist": 6,        # strikes per side whose 09:15 candle is pulled from REST
 
     # timing
     "ref_candle_time": "09:15",      # the 1-minute reference candle
     "squareoff_time": "15:15",
+
+    # candles (REST only) — WebSocket is LTP only
+    "rest_poll_seconds": 2.0,        # how often completed 1-min candles are polled
+    "bar_grace_seconds": 15.0,       # no candle for the previous minute after this -> use the last one
 
     # risk / orders
     "sl_points": 10.0,               # SL measured from the broken level

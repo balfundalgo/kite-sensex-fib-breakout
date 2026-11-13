@@ -8,8 +8,8 @@ Implements *SENSEX & BANK NIFTY Automated Options Breakout + Fibonacci Strategy 
 
 | Time | What happens |
 |---|---|
-| before 09:15 | Login, load BFO instruments, nearest SENSEX expiry, stream candidate strikes |
-| 09:16 | Pick one CE and one PE whose 09:15 1-min close is in ₹400–₹600, closest to ₹500. Confirm the 09:15 OHLC from Kite historical data |
+| before 09:16 | Login, load BFO instruments, nearest SENSEX expiry, candidate strikes |
+| 09:16 | Shortlist strikes by LTP, pull their 09:15 candle from REST, pick one CE and one PE whose 09:15 close is in ₹400–₹600, closest to ₹500 |
 | levels | H, L → +1000 → Day High = (H + √H) − 1000, Day Low = (L − √L) − 1000 → Fib 0 (Day Low) to 1 (Day High) |
 | trading | BUY when a tick crosses UP through a level ≥ 0.5 and the last completed 1-min candle is green |
 | exits | SL = broken level − ₹10. Target = next level; reaching it on a green candle opens the next trade at that level. 4.618 has no target |
@@ -17,6 +17,27 @@ Implements *SENSEX & BANK NIFTY Automated Options Breakout + Fibonacci Strategy 
 | 15:15 | Square-off |
 
 CE and PE are fully independent. No trade below 0.5, no trade on downward breaks.
+
+## Data: REST for candles, WebSocket for price
+
+Same split as the SENSEX VWAP ladder:
+
+| Source | Used for |
+|---|---|
+| REST `historical_data` (1-minute) | the 09:15 reference candle, and every 1-min candle used for the "preceding candle is green" check |
+| WebSocket (LTP mode) | level crosses, stop-loss, target, P/L |
+
+No candle is ever built from ticks. The REST feed (`src/restfeed.py`) polls every 2 s,
+drops the minute still forming, ignores anything before 09:15, abandons a hung call after
+10 s, and logs how late each candle arrived (shown in the status strip).
+
+Because REST lags a few seconds, a cross in the first seconds of a minute can happen
+before the previous candle is known. That cross is held as **PENDING** and decided when
+the candle lands: green and price still above the level → BUY; red, or price back below
+the level, or the minute ends first → skipped (logged). If a target is reached in that
+window, the target is booked immediately and the re-entry at that level waits for the
+candle the same way. If the previous minute has no candle at all after 15 s (no trades),
+the latest REST candle is used.
 
 ## Running from source (Mac)
 
@@ -40,6 +61,7 @@ Redirect URL on developers.kite.trade must be exactly `http://127.0.0.1:8765/`.
 |---|---|
 | `src/strategy.py` | All rules, pure Python, no broker |
 | `src/engine.py` | Daily flow, selection, ticks, risk, square-off |
+| `src/restfeed.py` | REST 1-minute candle feed |
 | `src/broker.py` | Account sessions, paper/live order router, stop handling |
 | `src/kite_auth.py` | Daily Kite login with local redirect catcher |
 | `src/gui.py` | CustomTkinter dashboard |

@@ -15,8 +15,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from strategy import (Candle, CandleBuilder, SideStrategy, day_high, day_low,  # noqa: E402
+from strategy import (Candle, SideStrategy, day_high, day_low,  # noqa: E402
                       fib_prices, pick_contract, round_down_tick)
+from restfeed import drop_forming, to_ist_naive  # noqa: E402
 
 PASSED = 0
 FAILED = 0
@@ -63,19 +64,19 @@ check("none in range", pick_contract([{"premium": 300}], 400, 600, 500) is None)
 check("boundary inclusive", pick_contract([{"sym": "X", "premium": 400}], 400, 600, 500)["sym"] == "X")
 
 
-# ---------------------------------------------------------------- candles
+# ---------------------------------------------------------------- REST candles
 t0 = datetime(2026, 11, 12, 9, 16)
-cb = CandleBuilder()
-cb.seed(Candle(t0 - timedelta(minutes=1), 500, 525, 400, 510))
-check("seeded 09:15 green", cb.prev_green())
-cb.update(t0, 510)
-cb.update(t0, 505)
-cb.update(t0 + timedelta(minutes=1), 506)
-check("09:16 red becomes last closed", not cb.prev_green())
-check("09:16 close", cb.last_closed.close == 505)
-cb.update(t0 + timedelta(minutes=1), 520)
-cb.update(t0 + timedelta(minutes=2), 521)
-check("09:17 green", cb.prev_green())
+check("candle green", Candle(t0, 500, 510, 495, 505).green)
+check("candle red", not Candle(t0, 505, 510, 495, 500).green)
+check("doji is not green", not Candle(t0, 500, 510, 495, 500).green)
+bars = [Candle(t0, 1, 1, 1, 1), Candle(t0 + timedelta(minutes=1), 1, 1, 1, 1)]
+kept = drop_forming(bars, t0 + timedelta(minutes=1, seconds=40))
+check("forming minute dropped", len(kept) == 1 and kept[0].minute == t0)
+kept = drop_forming(bars, t0 + timedelta(minutes=2))
+check("closed minute kept at its close", len(kept) == 2)
+import config  # noqa: E402
+aware = datetime(2026, 11, 12, 3, 46, tzinfo=__import__("datetime").timezone.utc)
+check("REST timestamp -> naive IST", to_ist_naive(aware) == datetime(2026, 11, 12, 9, 16))
 
 
 # ---------------------------------------------------------------- state machine
@@ -160,6 +161,66 @@ ce_s, pe_s = fresh(), SideStrategy("PE", fib_prices(day_high(540), day_low(410))
 ce_s.on_tick(460, True, True)
 ce_s.on_tick(465, True, True)
 check("PE untouched by CE trade", pe_s.position is None and ce_s.position is not None)
+
+# ---------------------------------------------------------------- pending (REST candle not yet in)
+M1 = datetime(2026, 11, 12, 9, 20)
+M2 = M1 + timedelta(minutes=1)
+
+s = fresh()
+s.on_tick(460, None, True, M1)
+a = s.on_tick(465, None, True, M1)
+check("cross with unknown candle -> PENDING", a and a[0]["kind"] == "PENDING" and s.position is None)
+check("pending level 0.5", s.pending and s.pending.level == 0.5)
+check("still unknown -> stays pending", s.resolve_pending(None, 466, True, M1) == [] and s.pending)
+a = s.resolve_pending(True, 467, True, M1)
+check("candle arrives green -> ENTER", a and a[0]["kind"] == "ENTER" and s.position.level == 0.5)
+check("SL still from the level", near(s.position.sl, round_down_tick(L05 - 10)))
+
+s = fresh()
+s.on_tick(460, None, True, M1)
+s.on_tick(465, None, True, M1)
+a = s.resolve_pending(False, 467, True, M1)
+check("candle arrives red -> SKIP", a and a[0]["kind"] == "SKIP" and s.position is None and s.pending is None)
+
+s = fresh()
+s.on_tick(460, None, True, M1)
+s.on_tick(465, None, True, M1)
+a = s.resolve_pending(True, 462, True, M1)
+check("green but price back below level -> SKIP", a and a[0]["kind"] == "SKIP" and s.position is None)
+
+s = fresh()
+s.on_tick(460, None, True, M1)
+s.on_tick(465, None, True, M1)
+a = s.resolve_pending(None, 470, True, M2)
+check("minute rolled over -> pending dropped", a and a[0]["kind"] == "SKIP" and s.pending is None)
+
+s = fresh()
+s.on_tick(460, None, True, M1)
+s.on_tick(465, None, True, M1)
+a = s.on_tick(466, True, True, M1)
+check("next tick after candle lands resolves pending", a and a[0]["kind"] == "ENTER")
+
+s = fresh()
+s.on_tick(460, None, True, M1)
+s.on_tick(465, None, True, M1)
+s.on_tick(L08 + 1, None, True, M1)
+check("higher cross while pending upgrades level", s.pending and s.pending.level == 0.8)
+
+# target reached while the candle is unknown: book target, hold re-entry as pending
+s = fresh()
+s.on_tick(460, True, True, M1)
+s.on_tick(465, True, True, M1)
+a = s.on_tick(L08 + 0.5, None, True, M2)
+check("target + unknown candle -> EXIT TARGET then PENDING",
+      [x["kind"] for x in a] == ["EXIT", "PENDING"] and s.position is None and s.pending.level == 0.8)
+a = s.resolve_pending(True, L08 + 1, True, M2)
+check("re-entry at 0.8 once green", a and a[0]["kind"] == "ENTER" and s.position.level == 0.8)
+
+s = fresh()
+s.on_tick(460, None, True, M1)
+s.on_tick(465, None, True, M1)
+s.force_exit("SQUAREOFF", 465)
+check("force exit clears pending", s.pending is None)
 
 
 print(f"\n{PASSED} passed, {FAILED} failed")

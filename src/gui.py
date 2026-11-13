@@ -48,10 +48,10 @@ def fmt_pnl(x):
 
 
 class SidePanel(ctk.CTkFrame):
-    FIELDS = [("Contract", "symbol"), ("09:15 O/H/L/C", "ref"), ("Day High", "day_high"),
-              ("Day Low", "day_low"), ("LTP", "ltp"), ("State", "state"),
-              ("Entry", "entry"), ("Stop-loss", "sl"), ("Target", "target"),
-              ("Open P/L", "pnl")]
+    FIELDS = [("Contract", "symbol"), ("09:15 O/H/L/C (REST)", "ref"), ("Day High", "day_high"),
+              ("Day Low", "day_low"), ("Last candle (REST)", "last_bar"), ("LTP (WebSocket)", "ltp"),
+              ("State", "state"), ("Prev candle", "prev_candle"), ("Entry", "entry"),
+              ("Stop-loss", "sl"), ("Target", "target"), ("Open P/L", "pnl")]
 
     def __init__(self, master, side, color):
         super().__init__(master, fg_color=CARD, corner_radius=12)
@@ -68,7 +68,7 @@ class SidePanel(ctk.CTkFrame):
         grid.pack(fill="x", padx=14)
         self.vals = {}
         for i, (label, key) in enumerate(self.FIELDS):
-            r, c = i % 5, (i // 5) * 2
+            r, c = i % 6, (i // 6) * 2
             ctk.CTkLabel(grid, text=label, text_color=SUB, anchor="w").grid(
                 row=r, column=c, sticky="w", pady=0, padx=(0 if c == 0 else 24, 8))
             v = ctk.CTkLabel(grid, text="—", text_color=TEXT, anchor="e",
@@ -105,6 +105,8 @@ class SidePanel(ctk.CTkFrame):
             "day_high": fmt(d.get("day_high")),
             "day_low": fmt(d.get("day_low")),
             "state": d.get("state") or "—",
+            "prev_candle": d.get("prev_candle") or "—",
+            "last_bar": d.get("last_bar") or "—",
             "entry": (f"{fmt(d.get('entry'))}  @ lvl {d['pos_level']:g}"
                       if d.get("pos_level") is not None else "—"),
             "sl": fmt(d.get("sl")),
@@ -116,9 +118,13 @@ class SidePanel(ctk.CTkFrame):
             self.vals[k].configure(text=v)
         pnl = d.get("pnl")
         self.vals["pnl"].configure(text_color=(OK if (pnl or 0) > 0 else WARN if (pnl or 0) < 0 else TEXT))
-        st = d.get("state")
+        pc = d.get("prev_candle")
+        self.vals["prev_candle"].configure(
+            text_color=OK if pc == "GREEN" else WARN if pc == "RED" else AMBER if pc == "waiting" else TEXT)
+        st = d.get("state") or ""
         self.badge.configure(text=f" {st} ",
-                             fg_color=OK if st == "IN TRADE" else ACCENT if st == "WATCHING" else MUTED)
+                             fg_color=(OK if st == "IN TRADE" else AMBER if st.startswith("PENDING")
+                                       else ACCENT if st == "WATCHING" else MUTED))
 
         levels = d.get("levels") or []
         ltp = d.get("ltp")
@@ -154,7 +160,7 @@ class App(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.title(f"{config.APP_NAME} v{config.APP_VERSION} — Balfund")
-        self.geometry("1480x940")
+        self.geometry("1500x960")
         self.minsize(1200, 760)
         self.configure(fg_color=BG)
 
@@ -212,8 +218,6 @@ class App(ctk.CTk):
         right.pack(side="right", padx=16)
         self.lbl_clock = ctk.CTkLabel(right, text="", font=ctk.CTkFont(size=18, weight="bold"))
         self.lbl_clock.pack(side="right", padx=(14, 0))
-        self.lbl_feed = ctk.CTkLabel(right, text="feed: offline", text_color=SUB)
-        self.lbl_feed.pack(side="right", padx=10)
         self.btn_unlock = ctk.CTkButton(right, text="Unlock", width=80, fg_color=MUTED,
                                         command=self._unlock)
         self.btn_unlock.pack(side="right", padx=4)
@@ -230,6 +234,12 @@ class App(ctk.CTk):
                                        hover_color="#27ae60", text_color="#0b1a10",
                                        command=self._start)
         self.btn_start.pack(side="right", padx=4)
+
+        strip = ctk.CTkFrame(self, fg_color=BG, corner_radius=0)
+        strip.pack(fill="x", padx=16, pady=(4, 0))
+        self.lbl_feed = ctk.CTkLabel(strip, text="WS: offline   |   REST candles: —",
+                                     text_color=SUB, anchor="w")
+        self.lbl_feed.pack(side="left")
         self._paint_mode()
 
     def _paint_mode(self):
@@ -450,9 +460,15 @@ class App(ctk.CTk):
         field("Premium max (₹)", "premium_max")
         field("Pick premium closest to (₹)", "premium_target", "09:15 candle close is compared")
         field("Strike window (± points from spot)", "strike_window")
+        field("Selection shortlist (strikes per side)", "selection_shortlist",
+              "closest by LTP; their 09:15 candle is pulled from REST")
         section("Timing")
         field("Reference candle (HH:MM)", "ref_candle_time", "1-minute candle")
         field("Square-off (HH:MM)", "squareoff_time")
+        section("Candles (REST)  ·  WebSocket is used only for LTP")
+        field("REST poll (seconds)", "rest_poll_seconds", "completed 1-min candles")
+        field("Candle grace (seconds)", "bar_grace_seconds",
+              "no candle for the previous minute after this -> use the last one")
         section("Orders & risk")
         field("Stop-loss (₹ below broken level)", "sl_points")
         field("Product", "product", kind="option", options=["MIS", "NRML"])
@@ -477,8 +493,9 @@ class App(ctk.CTk):
         s = config.SETTINGS
         new = {}
         numeric = {"premium_min", "premium_max", "premium_target", "strike_window",
-                   "sl_points", "sl_limit_buffer", "max_daily_loss"}
-        ints = {"redirect_port", "market_protection"}
+                   "sl_points", "sl_limit_buffer", "max_daily_loss",
+                   "rest_poll_seconds", "bar_grace_seconds"}
+        ints = {"redirect_port", "market_protection", "selection_shortlist"}
         try:
             for key, (v, kind) in self.set_vars.items():
                 val = v.get()
@@ -591,8 +608,19 @@ class App(ctk.CTk):
         color = {"TRADING": OK, "LOCKED": WARN, "HALTED": WARN, "ERROR": WARN,
                  "SQUARED OFF": ACCENT, "STOPPED": MUTED}.get(st, AMBER)
         self.lbl_status.configure(text=f" {st} ", fg_color=color, text_color="#111")
-        self.lbl_feed.configure(text=f"feed: {'live' if s['feed'] else 'offline'} · {s['ticks']:,} ticks",
-                                text_color=OK if s["feed"] else SUB)
+        rest = s.get("rest")
+        if rest and rest.get("avg_lag") is not None:
+            rtxt = (f"REST candles: lag {rest['avg_lag']:.1f}s avg / {rest['max_lag']:.1f}s max"
+                    + (f" · {rest['errors']} err" if rest["errors"] else ""))
+        elif rest:
+            rtxt = "REST candles: waiting for first bar"
+        else:
+            rtxt = "REST candles: —"
+        if rest and rest.get("blind"):
+            rtxt = "REST candles: NO DATA"
+        self.lbl_feed.configure(
+            text=f"WS: {'live' if s['feed'] else 'offline'} · {s['ticks']:,} ticks   |   {rtxt}",
+            text_color=(WARN if rest and rest.get("blind") else OK if s["feed"] else SUB))
         if st in ("STOPPED", "ERROR"):
             self.btn_start.configure(state="normal")
             self.btn_stop.configure(state="disabled")

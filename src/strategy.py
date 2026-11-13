@@ -17,6 +17,14 @@ Settled rules:
     (green candle) exits the old trade and opens a new one at that level.
   * 4.618: no target, SL only, runs to square-off
   * downward breaks never trade; CE and PE are fully independent
+
+Candles vs ticks (v1.1):
+  Candle OHLC comes ONLY from Kite's REST historical API (exact exchange
+  candles). Ticks are used only for what REST cannot see inside a minute:
+  the level cross, SL, target and P/L. REST lags a few seconds, so in the
+  first seconds of a minute the preceding candle may not be known yet. A
+  cross in that window is held as PENDING and decided the moment the candle
+  arrives: green and price still above the level -> BUY, otherwise skipped.
 """
 
 import math
@@ -73,33 +81,6 @@ class Candle:
         return self.close > self.open
 
 
-class CandleBuilder:
-    """1-minute candles from ticks. last_closed is the candle before the
-    minute of the most recent tick."""
-
-    def __init__(self):
-        self.current: Optional[Candle] = None
-        self.last_closed: Optional[Candle] = None
-
-    def seed(self, candle: Candle) -> None:
-        self.last_closed = candle
-
-    def update(self, minute, price: float) -> None:
-        c = self.current
-        if c is None or minute > c.minute:
-            if c is not None:
-                self.last_closed = c
-            self.current = Candle(minute, price, price, price, price)
-        elif minute == c.minute:
-            c.high = max(c.high, price)
-            c.low = min(c.low, price)
-            c.close = price
-        # ticks for an older minute (late packets) are ignored
-
-    def prev_green(self) -> bool:
-        return bool(self.last_closed and self.last_closed.green)
-
-
 # ----------------------------------------------------------------------
 # per-side state machine
 # ----------------------------------------------------------------------
@@ -112,7 +93,17 @@ class Position:
     target_price: Optional[float]
 
 
+@dataclass
+class Pending:
+    level: float
+    level_price: float
+    minute: object           # minute in which the cross happened
+
+
 class SideStrategy:
+    """prev_green passed in by the engine is True / False when the preceding
+    1-minute REST candle is known, or None while it has not arrived yet."""
+
     def __init__(self, side: str, prices: list, sl_points: float = 10.0,
                  tick: float = 0.05, min_level: float = MIN_TRADE_LEVEL):
         self.side = side
@@ -121,6 +112,7 @@ class SideStrategy:
         self.tick = tick
         self.min_level = min_level
         self.position: Optional[Position] = None
+        self.pending: Optional[Pending] = None
         self.prev_ltp: Optional[float] = None
 
     # -- helpers --------------------------------------------------------
@@ -146,10 +138,14 @@ class SideStrategy:
         )
         return self.position
 
+    def _set_pending(self, level, price, minute):
+        if self.pending is None or self.pending.minute != minute or level > self.pending.level:
+            self.pending = Pending(level, price, minute)
+
     # -- main entry -----------------------------------------------------
-    def on_tick(self, ltp: float, prev_green: bool, entries_allowed: bool) -> list:
-        """Returns a list of actions:
-           {'kind': 'ENTER'|'EXIT'|'ROLL', 'reason', 'price', 'position', 'old'}"""
+    def on_tick(self, ltp: float, prev_green: Optional[bool], entries_allowed: bool,
+                minute=None) -> list:
+        """Returns actions: {'kind': 'ENTER'|'EXIT'|'ROLL'|'PENDING'|'SKIP', ...}"""
         prev, self.prev_ltp = self.prev_ltp, ltp
         if prev is None:
             return []                            # need a previous tick to see a cross
@@ -158,29 +154,74 @@ class SideStrategy:
         if pos is not None:
             if ltp <= pos.sl:
                 self.position = None
+                self.pending = None
                 return [{"kind": "EXIT", "reason": "SL", "price": ltp, "old": pos}]
 
             if pos.target_price is not None and ltp >= pos.target_price:
                 crossed = self.crossed_up(prev, ltp)
-                if crossed and prev_green and entries_allowed:
+                if crossed and entries_allowed:
                     lvl, p = crossed[-1]
-                    new = self._open(lvl, p)
-                    return [{"kind": "ROLL", "reason": "TARGET", "price": ltp,
-                             "old": pos, "position": new}]
+                    if prev_green is True:
+                        new = self._open(lvl, p)
+                        return [{"kind": "ROLL", "reason": "TARGET", "price": ltp,
+                                 "old": pos, "position": new}]
+                    if prev_green is None:
+                        # book the target now, decide the new entry when the candle lands
+                        self.position = None
+                        self._set_pending(lvl, p, minute)
+                        return [{"kind": "EXIT", "reason": "TARGET", "price": ltp, "old": pos},
+                                {"kind": "PENDING", "level": lvl, "price": ltp}]
                 self.position = None
                 return [{"kind": "EXIT", "reason": "TARGET", "price": ltp, "old": pos}]
             return []
 
         if not entries_allowed:
+            self.pending = None
             return []
+
+        actions = []
         crossed = self.crossed_up(prev, ltp)
-        if crossed and prev_green:
+        if crossed:
             lvl, p = crossed[-1]
-            return [{"kind": "ENTER", "reason": f"BREAK {lvl:g}", "price": ltp,
-                     "position": self._open(lvl, p)}]
-        return []
+            if prev_green is True:
+                self.pending = None
+                return [{"kind": "ENTER", "reason": f"BREAK {lvl:g}", "price": ltp,
+                         "position": self._open(lvl, p)}]
+            if prev_green is None:
+                self._set_pending(lvl, p, minute)
+                actions.append({"kind": "PENDING", "level": lvl, "price": ltp})
+                return actions
+            # red: no trade on this cross
+        if self.pending is not None and prev_green is not None:
+            actions += self.resolve_pending(prev_green, ltp, entries_allowed, minute)
+        return actions
+
+    def resolve_pending(self, prev_green: Optional[bool], ltp: Optional[float],
+                        entries_allowed: bool, minute=None) -> list:
+        """Decide a held cross once the preceding candle is known."""
+        pd = self.pending
+        if pd is None or self.position is not None:
+            self.pending = None
+            return []
+        if minute is not None and pd.minute is not None and minute != pd.minute:
+            self.pending = None
+            return [{"kind": "SKIP", "level": pd.level,
+                     "reason": "candle did not arrive within the minute"}]
+        if prev_green is None:
+            return []
+        self.pending = None
+        if not prev_green:
+            return [{"kind": "SKIP", "level": pd.level, "reason": "preceding candle red"}]
+        if not entries_allowed:
+            return [{"kind": "SKIP", "level": pd.level, "reason": "entries blocked"}]
+        if ltp is None or ltp <= pd.level_price:
+            return [{"kind": "SKIP", "level": pd.level,
+                     "reason": "price fell back below the level before the candle arrived"}]
+        return [{"kind": "ENTER", "reason": f"BREAK {pd.level:g} (confirmed)", "price": ltp,
+                 "position": self._open(pd.level, pd.level_price)}]
 
     def force_exit(self, reason: str, ltp: float) -> list:
+        self.pending = None
         pos, self.position = self.position, None
         if pos is None:
             return []
