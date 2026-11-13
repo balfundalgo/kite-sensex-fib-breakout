@@ -17,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from strategy import (Candle, SideStrategy, day_high, day_low,  # noqa: E402
                       fib_prices, pick_contract, round_down_tick)
-from restfeed import drop_forming, to_ist_naive  # noqa: E402
+from restfeed import RestCandleFeed, drop_forming, same_ohlc, to_ist_naive  # noqa: E402
 
 PASSED = 0
 FAILED = 0
@@ -221,6 +221,51 @@ s.on_tick(460, None, True, M1)
 s.on_tick(465, None, True, M1)
 s.force_exit("SQUAREOFF", 465)
 check("force exit clears pending", s.pending is None)
+
+# ---------------------------------------------------------------- REST feed: settle + revisions
+class _FakeKite:
+    def __init__(self):
+        self.rows = {}
+
+    def historical_data(self, token, frm, to, interval):
+        return [{"date": m, "open": o, "high": h, "low": l, "close": c}
+                for m, (o, h, l, c) in sorted(self.rows.items()) if frm <= m <= to]
+
+
+S0 = datetime(2026, 11, 12, 9, 15)
+fk = _FakeKite()
+clock = [S0 + timedelta(minutes=1, seconds=2)]
+got, revs = [], []
+feed = RestCandleFeed(fk, {"CE": 1}, S0, on_bar=lambda *a: got.append(a),
+                      on_revise=lambda *a: revs.append(a), now_fn=lambda: clock[0],
+                      settle=5, verify_minutes=5)
+ref = Candle(S0, 500, 525, 400, 510)
+feed.remember("CE", ref)
+fk.rows[S0] = (500, 525, 400, 510)
+m1 = S0 + timedelta(minutes=1)
+fk.rows[m1] = (510, 515, 505, 512)                      # 09:16 early (incomplete) version
+clock[0] = m1 + timedelta(minutes=1, seconds=2)          # 09:17:02 -> not settled
+feed._poll_leg("CE", 1)
+check("not accepted before settle", got == [])
+clock[0] = m1 + timedelta(minutes=1, seconds=6)          # 09:17:06 -> settled
+feed._poll_leg("CE", 1)
+check("accepted after settle", len(got) == 1 and got[0][1].close == 512)
+feed._poll_leg("CE", 1)
+check("accepted once only", len(got) == 1)
+fk.rows[m1] = (510, 518, 505, 509)                      # Zerodha finalises it differently
+clock[0] = m1 + timedelta(minutes=1, seconds=20)
+feed._poll_leg("CE", 1)
+check("revision detected", len(revs) == 1 and revs[0][2].close == 509 and revs[0][1].close == 512)
+check("revision age recorded", near(revs[0][3], 20, 0.5))
+feed._poll_leg("CE", 1)
+check("same revision reported once", len(revs) == 1)
+fk.rows[S0] = (500, 530, 400, 510)                      # reference revised too
+feed._poll_leg("CE", 1)
+check("reference candle verified", len(revs) == 2 and revs[1][2].high == 530)
+check("same_ohlc", same_ohlc(Candle(S0, 1, 2, 0.5, 1.5), Candle(S0, 1, 2, 0.5, 1.5)))
+fk.rows[S0 - timedelta(days=1)] = (1, 1, 1, 1)
+feed._poll_leg("CE", 1)
+check("yesterday never emitted", all(a[1].minute >= S0 for a in got))
 
 
 print(f"\n{PASSED} passed, {FAILED} failed")

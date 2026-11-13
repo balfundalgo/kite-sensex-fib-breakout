@@ -467,6 +467,10 @@ class App(ctk.CTk):
         field("Square-off (HH:MM)", "squareoff_time")
         section("Candles (REST)  ·  WebSocket is used only for LTP")
         field("REST poll (seconds)", "rest_poll_seconds", "completed 1-min candles")
+        field("Candle settle (seconds)", "candle_settle_seconds",
+              "accept a candle only this long after its minute closes")
+        field("Re-verify candles (minutes)", "candle_verify_minutes",
+              "revisions by Zerodha within this window are applied and logged")
         field("Candle grace (seconds)", "bar_grace_seconds",
               "no candle for the previous minute after this -> use the last one")
         section("Orders & risk")
@@ -494,8 +498,9 @@ class App(ctk.CTk):
         new = {}
         numeric = {"premium_min", "premium_max", "premium_target", "strike_window",
                    "sl_points", "sl_limit_buffer", "max_daily_loss",
-                   "rest_poll_seconds", "bar_grace_seconds"}
-        ints = {"redirect_port", "market_protection", "selection_shortlist"}
+                   "rest_poll_seconds", "bar_grace_seconds", "candle_settle_seconds"}
+        ints = {"redirect_port", "market_protection", "selection_shortlist",
+                "candle_verify_minutes"}
         try:
             for key, (v, kind) in self.set_vars.items():
                 val = v.get()
@@ -611,6 +616,9 @@ class App(ctk.CTk):
         rest = s.get("rest")
         if rest and rest.get("avg_lag") is not None:
             rtxt = (f"REST candles: lag {rest['avg_lag']:.1f}s avg / {rest['max_lag']:.1f}s max"
+                    + f" · revisions {rest['revisions']}"
+                    + (f" (latest {rest['max_revision_age']:.0f}s after close)"
+                       if rest.get("max_revision_age") is not None else "")
                     + (f" · {rest['errors']} err" if rest["errors"] else ""))
         elif rest:
             rtxt = "REST candles: waiting for first bar"

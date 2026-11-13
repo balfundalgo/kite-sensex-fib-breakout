@@ -6,6 +6,8 @@ One app log per day plus two CSV trails:
   logs/app_YYYY-MM-DD.log     everything the engine does
   logs/trades_YYYY-MM-DD.csv  one row per strategy trade (entry -> exit)
   logs/orders_YYYY-MM-DD.csv  one row per broker order, per account
+  logs/candles_YYYY-MM-DD.csv every REST candle used (and every revision),
+                              for checking against the Kite chart
 """
 
 import csv
@@ -72,6 +74,10 @@ ORDER_FIELDS = ["time", "account", "broker", "symbol", "txn", "order_type",
                 "order_id", "result", "mode"]
 
 
+CANDLE_FIELDS = ["time", "side", "symbol", "minute", "open", "high", "low", "close",
+                 "colour", "event", "lag_s", "previous"]
+
+
 def _append(prefix: str, fields: list, row: dict) -> None:
     path = config.LOG_DIR / f"{prefix}_{_today()}.csv"
     with _csv_lock:
@@ -92,3 +98,8 @@ def order_row(row: dict) -> None:
     row.setdefault("time", datetime.now().strftime("%H:%M:%S"))
     row.setdefault("broker", config.BROKER)
     _append("orders", ORDER_FIELDS, row)
+
+
+def candle_row(row: dict) -> None:
+    row.setdefault("time", datetime.now().strftime("%H:%M:%S"))
+    _append("candles", CANDLE_FIELDS, row)

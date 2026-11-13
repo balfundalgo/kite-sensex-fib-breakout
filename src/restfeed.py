@@ -8,10 +8,6 @@ Same approach as the SENSEX VWAP ladder build:
                used for the "preceding candle is green" check)
     WebSocket  LTP only — level crosses, stop-loss, target, P/L
 
-Why: a candle built from ticks misses any trade that happens between two
-ticks, so its high/low/close can differ from the exchange candle. The REST
-candle is the exchange's own.
-
 Rules carried over from the VWAP feed (each learned from a live failure):
   * the minute still forming is dropped before anything sees it
   * nothing before today's 09:15 ever reaches the strategy
@@ -19,6 +15,15 @@ Rules carried over from the VWAP feed (each learned from a live failure):
     the strategy; it is abandoned and the next poll carries on
   * every bar records how late it arrived; slow bars and a feed that has
     stopped delivering are logged loudly instead of failing silently
+
+v1.2 — candles were being accepted 0.2-3 s after the minute closed and never
+looked at again. A candle served that early can still be missing the last
+trades of the minute. Now:
+  * SETTLE: a candle is accepted only `settle` seconds after its minute closes
+  * VERIFY: every poll re-reads the last `verify_minutes` candles; if Zerodha
+    has changed one since we accepted it, on_revise() is called with the old
+    and new values, so the engine corrects it and the log shows exactly how
+    often and how late revisions happen
 """
 
 import threading
@@ -39,9 +44,15 @@ def to_ist_naive(dt) -> datetime:
     return dt
 
 
-def drop_forming(candles: List[Candle], now: datetime) -> List[Candle]:
-    """Remove the minute that is still being built (close time in the future)."""
-    return [c for c in candles if c.minute + timedelta(minutes=1) <= now]
+def drop_forming(candles: List[Candle], now: datetime, settle: float = 0.0) -> List[Candle]:
+    """Keep only minutes that closed at least `settle` seconds ago."""
+    cut = timedelta(minutes=1, seconds=settle)
+    return [c for c in candles if c.minute + cut <= now]
+
+
+def same_ohlc(a: Candle, b: Candle) -> bool:
+    return (abs(a.open - b.open) < 1e-6 and abs(a.high - b.high) < 1e-6
+            and abs(a.low - b.low) < 1e-6 and abs(a.close - b.close) < 1e-6)
 
 
 def fetch_1m(kite, token: int, frm: datetime, to: datetime) -> List[Candle]:
@@ -57,26 +68,31 @@ def fetch_1m(kite, token: int, frm: datetime, to: datetime) -> List[Candle]:
 
 class RestCandleFeed:
     """
-    Polls the 1-minute endpoint for each leg and calls on_bar(side, candle, lag)
-    once for every newly completed candle, in order.
+    Polls the 1-minute endpoint for each leg.
+      on_bar(side, candle, lag, replay)        a newly accepted candle, in order
+      on_revise(side, old, new, age_seconds)   an accepted candle that changed
     """
 
     def __init__(self, kite, legs: Dict[str, int], session_start: datetime,
-                 on_bar: Callable, now_fn: Callable, poll: float = 2.0,
+                 on_bar: Callable, now_fn: Callable, on_revise: Optional[Callable] = None,
+                 poll: float = 2.0, settle: float = 5.0, verify_minutes: int = 5,
                  hard_deadline: float = 10.0, blind_seconds: float = 180.0,
                  late_warn: float = 20.0):
         self.kite = kite
         self.legs = dict(legs)                  # {"CE": token, "PE": token}
         self.session_start = session_start      # today 09:15, naive IST
         self.on_bar = on_bar
+        self.on_revise = on_revise
         self.now = now_fn
         self.poll = poll
+        self.settle = settle
+        self.verify_minutes = verify_minutes
         self.hard_deadline = hard_deadline
         self.blind_seconds = blind_seconds
         self.late_warn = late_warn
 
-        self._last: Dict[str, datetime] = {}    # last minute emitted per leg
-        self._polled = set()                    # legs that completed a first poll
+        self._last: Dict[str, datetime] = {}           # last minute accepted per leg
+        self._seen: Dict[str, Dict[datetime, Candle]] = {s: {} for s in self.legs}
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="restpoll")
@@ -84,6 +100,8 @@ class RestCandleFeed:
         self.polls = 0
         self.errors = 0
         self.abandoned = 0
+        self.revisions = 0
+        self.revision_ages: List[float] = []
         self.last_bar_at = time.time()
         self.last_bar_minute: Optional[datetime] = None
         self._blind_warned = 0.0
@@ -91,14 +109,18 @@ class RestCandleFeed:
         self._suppressed = 0
 
     # -- lifecycle ---------------------------------------------------------
-    def prime(self, side: str, upto: datetime):
-        """Everything at or before `upto` is already handled (e.g. the 09:15 candle)."""
-        self._last[side] = max(self._last.get(side, upto), upto)
+    def remember(self, side: str, c: Candle):
+        """A candle already handed to the engine (reference / backfill):
+        mark it accepted so it is not emitted again, but keep verifying it."""
+        self._seen[side][c.minute] = c
+        if self._last.get(side) is None or c.minute > self._last[side]:
+            self._last[side] = c.minute
 
     def start(self):
         self._thread = threading.Thread(target=self._loop, daemon=True, name="restfeed")
         self._thread.start()
-        logger.info("REST candle feed started: 1-minute bars, polling every %.1fs", self.poll)
+        logger.info("REST candle feed started: 1-minute bars, poll %.1fs, settle %.0fs, "
+                    "re-verify last %d min", self.poll, self.settle, self.verify_minutes)
 
     def stop(self):
         self._stop.set()
@@ -129,29 +151,55 @@ class RestCandleFeed:
 
     def _poll_leg(self, side: str, token: int):
         now = self.now()
-        candles = fetch_1m(self.kite, token, self.session_start, now)
+        frm = max(self.session_start, now - timedelta(minutes=self.verify_minutes + 3))
+        if self._last.get(side) is None:
+            frm = self.session_start
+        candles = fetch_1m(self.kite, token, frm, now)
         self.polls += 1
-        candles = drop_forming(candles, self.now())
+        now = self.now()
+        closed = drop_forming(candles, now)            # every minute that has ended
+        seen = self._seen[side]
         last = self._last.get(side)
-        replay = side not in self._polled       # first poll = backlog, not live bars
-        self._polled.add(side)
-        for c in sorted(candles, key=lambda x: x.minute):
+        verify_from = now - timedelta(minutes=self.verify_minutes + 1)
+
+        for c in sorted(closed, key=lambda x: x.minute):
             if c.minute < self.session_start:
-                continue                       # never yesterday's candles
-            if last is not None and c.minute <= last:
+                continue                               # never yesterday's candles
+            close_at = c.minute + timedelta(minutes=1)
+
+            old = seen.get(c.minute)
+            if old is not None:
+                # already accepted: re-verify recent ones
+                if c.minute >= verify_from and not same_ohlc(old, c):
+                    age = (now - close_at).total_seconds()
+                    seen[c.minute] = c
+                    self.revisions += 1
+                    self.revision_ages.append(age)
+                    if self.on_revise:
+                        self.on_revise(side, old, c, age)
                 continue
-            closed_at = c.minute + timedelta(minutes=1)
-            lag = (self.now() - closed_at).total_seconds()
-            if not replay:
-                self.latencies.append(lag)
-                if len(self.latencies) > 2000:
-                    self.latencies = self.latencies[-1000:]
-                self._warn_late(side, c, lag)
+
+            if last is not None and c.minute <= last:
+                continue                               # older than what we accepted, skip
+            if (now - close_at).total_seconds() < self.settle:
+                break                                  # not settled yet; later minutes neither
+
+            lag = (now - close_at).total_seconds()
+            self.latencies.append(lag)
+            if len(self.latencies) > 2000:
+                self.latencies = self.latencies[-1000:]
+            self._warn_late(side, c, lag)
+            seen[c.minute] = c
             self._last[side] = c.minute
             last = c.minute
             self.last_bar_at = time.time()
             self.last_bar_minute = c.minute
-            self.on_bar(side, c, lag, replay)
+            self.on_bar(side, c, lag, False)
+
+        # keep memory bounded
+        if len(seen) > 400:
+            for k in sorted(seen)[:-200]:
+                seen.pop(k, None)
 
     def _warn_late(self, side, c, lag):
         if lag <= self.late_warn:
@@ -184,6 +232,8 @@ class RestCandleFeed:
             "bars": len(self.latencies),
             "avg_lag": (sum(lat) / len(lat)) if lat else None,
             "max_lag": max(lat) if lat else None,
+            "revisions": self.revisions,
+            "max_revision_age": max(self.revision_ages) if self.revision_ages else None,
             "last_bar": self.last_bar_minute,
             "blind": (time.time() - self.last_bar_at) >= self.blind_seconds,
         }

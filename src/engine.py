@@ -15,6 +15,10 @@ The daily flow.
 Data split (same as the SENSEX VWAP ladder):
     REST       all candle OHLC
     WebSocket  LTP only
+
+v1.2: candles are accepted only after a settle delay and re-verified for
+several minutes; any revision Zerodha makes is applied and logged. Every
+candle used is written to logs/candles_<date>.csv for checking.
 """
 
 import threading
@@ -26,8 +30,8 @@ from kiteconnect import KiteTicker
 import broker
 import config
 from broker import OrderRouter, Trade
-from logger import logger, trade_row
-from restfeed import RestCandleFeed, fetch_1m
+from logger import candle_row, logger, trade_row
+from restfeed import RestCandleFeed, drop_forming, fetch_1m
 from strategy import SideStrategy, day_high, day_low, fib_prices, pick_contract
 
 SIDES = ("CE", "PE")
@@ -152,7 +156,7 @@ class Engine:
                 self._set_status(f"WAITING {ref_end.strftime('%H:%M')}")
                 logger.info("Waiting for the %s candle to close (selection at %s)",
                             ref_start.strftime("%H:%M"), ref_end.strftime("%H:%M"))
-            self._wait_until(ref_end + timedelta(seconds=2))
+            self._wait_until(ref_end + timedelta(seconds=float(self.s.get("candle_settle_seconds", 5)) + 1))
             if not self.running:
                 return
 
@@ -290,28 +294,67 @@ class Engine:
         sd = self.sides[side]
         sd.symbol = row["tradingsymbol"]
         sd.token = row["instrument_token"]
+        sd.bars = {ref.minute: ref}
+        sd.last_bar = ref
+        self._apply_ref(sd, ref)
+        self._candle_log(sd, ref, "REFERENCE")
+
+    def _apply_ref(self, sd, ref):
+        """Levels from the 09:15 candle. Also used if Zerodha revises that candle
+        before this side has traded."""
         sd.ref = ref
         sd.day_high = day_high(ref.high)
         sd.day_low = day_low(ref.low)
         sd.levels = fib_prices(sd.day_high, sd.day_low)
-        sd.bars = {ref.minute: ref}
-        sd.last_bar = ref
-        sd.strategy = SideStrategy(side, sd.levels, float(self.s["sl_points"]), self.tick_size)
+        prev_ltp = sd.strategy.prev_ltp if sd.strategy else None
+        sd.strategy = SideStrategy(sd.side, sd.levels, float(self.s["sl_points"]), self.tick_size)
+        sd.strategy.prev_ltp = prev_ltp
         logger.info("%s %s | 09:15 O %.2f H %.2f L %.2f C %.2f | Day High %.2f Day Low %.2f",
-                    side, sd.symbol, ref.open, ref.high, ref.low, ref.close, sd.day_high, sd.day_low)
-        logger.info("%s levels: %s", side,
+                    sd.side, sd.symbol, ref.open, ref.high, ref.low, ref.close,
+                    sd.day_high, sd.day_low)
+        logger.info("%s levels: %s", sd.side,
                     "  ".join(f"{lvl:g}={p:.2f}" for lvl, p in sd.levels))
+
+    def _candle_log(self, sd, c, event, lag=None, previous=None):
+        candle_row({
+            "side": sd.side, "symbol": sd.symbol, "minute": c.minute.strftime("%H:%M"),
+            "open": f"{c.open:.2f}", "high": f"{c.high:.2f}", "low": f"{c.low:.2f}",
+            "close": f"{c.close:.2f}", "colour": "GREEN" if c.green else "red",
+            "event": event, "lag_s": f"{lag:.1f}" if lag is not None else "",
+            "previous": (f"O {previous.open:.2f} H {previous.high:.2f} "
+                         f"L {previous.low:.2f} C {previous.close:.2f}") if previous else "",
+        })
 
     # ==================================================================
     # REST candles
     # ==================================================================
     def _start_rest_feed(self, ref_start):
         legs = {side: sd.token for side, sd in self.sides.items() if sd.token}
+        settle = float(self.s.get("candle_settle_seconds", 5))
         self.feed = RestCandleFeed(
-            self.data.kite, legs, ref_start, on_bar=self._on_rest_bar, now_fn=_naive_now,
-            poll=float(self.s.get("rest_poll_seconds", 2.0)))
+            self.data.kite, legs, ref_start, on_bar=self._on_rest_bar,
+            on_revise=self._on_rest_revise, now_fn=_naive_now,
+            poll=float(self.s.get("rest_poll_seconds", 2.0)), settle=settle,
+            verify_minutes=int(self.s.get("candle_verify_minutes", 5)))
         for side in legs:
-            self.feed.prime(side, ref_start)       # 09:15 already used as the reference
+            sd = self.sides[side]
+            self.feed.remember(side, sd.ref)
+            # Late start: load every settled candle since 09:15 BEFORE trading,
+            # so the colour check never falls back to a stale candle.
+            if _naive_now() > ref_start + timedelta(minutes=2):
+                try:
+                    hist = drop_forming(fetch_1m(self.data.kite, sd.token, ref_start, _naive_now()),
+                                        _naive_now(), settle)
+                    for c in hist:
+                        if c.minute > ref_start:
+                            sd.bars[c.minute] = c
+                            sd.last_bar = c
+                            self.feed.remember(side, c)
+                    logger.info("[%s] backfilled %d REST candles since %s", side,
+                                len([c for c in hist if c.minute > ref_start]),
+                                ref_start.strftime("%H:%M"))
+                except Exception as e:
+                    logger.error("[%s] backfill failed: %s", side, e)
         self.feed.start()
 
     def _on_rest_bar(self, side, c, lag, replay):
@@ -324,7 +367,32 @@ class Engine:
                 logger.info("[%s] %s O %.2f H %.2f L %.2f C %.2f %s  (+%.1fs)",
                             side, c.minute.strftime("%H:%M"), c.open, c.high, c.low, c.close,
                             "GREEN" if c.green else "red", lag)
+                self._candle_log(sd, c, "NEW", lag)
             self._resolve(sd, _naive_now())
+
+    def _on_rest_revise(self, side, old, new, age):
+        with self.lock:
+            sd = self.sides[side]
+            sd.bars[new.minute] = new
+            if sd.last_bar is not None and sd.last_bar.minute == new.minute:
+                sd.last_bar = new
+            flip = old.green != new.green
+            logger.warning("[%s] %s candle REVISED by Zerodha %.0fs after close: "
+                           "O %.2f H %.2f L %.2f C %.2f -> O %.2f H %.2f L %.2f C %.2f%s",
+                           side, new.minute.strftime("%H:%M"), age,
+                           old.open, old.high, old.low, old.close,
+                           new.open, new.high, new.low, new.close,
+                           "  (COLOUR CHANGED)" if flip else "")
+            self._candle_log(sd, new, "REVISED", age, previous=old)
+            if sd.ref is not None and new.minute == sd.ref.minute:
+                traded = any(t.side == side for t in self.trades)
+                if not traded and sd.strategy and sd.strategy.position is None:
+                    logger.warning("[%s] 09:15 reference revised before any trade: "
+                                   "recomputing Day High / Day Low / levels", side)
+                    self._apply_ref(sd, new)
+                else:
+                    logger.warning("[%s] 09:15 reference revised after trading started; "
+                                   "levels kept as they were", side)
 
     def prev_green(self, sd, now):
         """Colour of the 1-min candle before `now`'s minute, from REST.
@@ -337,7 +405,9 @@ class Engine:
             return c.green
         grace = float(self.s.get("bar_grace_seconds", 15))
         if (now - m).total_seconds() >= grace:
-            older = [k for k in sd.bars if k < m]
+            # only a recent candle may stand in (no trades last minute);
+            # never something from minutes or hours ago
+            older = [k for k in sd.bars if m - timedelta(minutes=3) <= k < m]
             if older:
                 if sd._fallback_logged != m:
                     sd._fallback_logged = m
