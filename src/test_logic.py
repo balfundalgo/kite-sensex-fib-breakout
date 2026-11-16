@@ -17,7 +17,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from strategy import (Candle, SideStrategy, day_high, day_low,  # noqa: E402
                       fib_prices, pick_contract, round_down_tick)
-from restfeed import RestCandleFeed, drop_forming, same_ohlc, to_ist_naive  # noqa: E402
+from restfeed import (RestCandleFeed, drop_forming, fetch_1m, fetch_closed, fetch_minute,  # noqa: E402
+                      floor_minute, same_ohlc, to_ist_naive)
 
 PASSED = 0
 FAILED = 0
@@ -238,7 +239,7 @@ clock = [S0 + timedelta(minutes=1, seconds=2)]
 got, revs = [], []
 feed = RestCandleFeed(fk, {"CE": 1}, S0, on_bar=lambda *a: got.append(a),
                       on_revise=lambda *a: revs.append(a), now_fn=lambda: clock[0],
-                      settle=5, verify_minutes=5)
+                      settle=5)
 ref = Candle(S0, 500, 525, 400, 510)
 feed.remember("CE", ref)
 fk.rows[S0] = (500, 525, 400, 510)
@@ -266,6 +267,112 @@ check("same_ohlc", same_ohlc(Candle(S0, 1, 2, 0.5, 1.5), Candle(S0, 1, 2, 0.5, 1
 fk.rows[S0 - timedelta(days=1)] = (1, 1, 1, 1)
 feed._poll_leg("CE", 1)
 check("yesterday never emitted", all(a[1].minute >= S0 for a in got))
+
+# ---------------------------------------------------------------- v1.3: request alignment
+# Simulates Kite: candles are bucketed from the request's `from` time, so a
+# `from` with seconds returns shifted candles (the 16 Nov defect).
+class _TickKite:
+    def __init__(self, ticks):
+        self.ticks = ticks                       # [(datetime, price)] one per second
+        self.calls = []
+
+    def historical_data(self, token, frm, to, interval):
+        self.calls.append(frm)
+        out, start = [], frm
+        while start <= to:
+            end = start + timedelta(minutes=1)
+            px = [p for t, p in self.ticks if start <= t < end and t <= to]
+            if px:
+                out.append({"date": start, "open": px[0], "high": max(px),
+                            "low": min(px), "close": px[-1]})
+            start = end
+        return out
+
+
+import math  # noqa: E402
+T0 = datetime(2026, 11, 16, 9, 15)
+ticks = [(T0 + timedelta(seconds=i), round(500 + 30 * math.sin(i / 7.0) + (i % 5), 2))
+         for i in range(60 * 30)]
+tk = _TickKite(ticks)
+check("floor_minute", floor_minute(datetime(2026, 1, 1, 10, 5, 3, 400)) == datetime(2026, 1, 1, 10, 5))
+aligned = {c.minute: c for c in fetch_1m(tk, 1, T0, T0 + timedelta(minutes=29))}
+odd = {c.minute: c for c in fetch_1m(tk, 1, T0 + timedelta(minutes=3, seconds=17),
+                                     T0 + timedelta(minutes=29))}
+check("fetch_1m floors a from-time with seconds", tk.calls[-1].second == 0)
+check("odd from-time gives identical candles",
+      all(same_ohlc(odd[m], aligned[m]) for m in odd))
+
+clock = [T0 + timedelta(minutes=12, seconds=6)]
+got, revs = [], []
+feed = RestCandleFeed(tk, {"CE": 1}, T0, on_bar=lambda *a: got.append(a),
+                      on_revise=lambda *a: revs.append(a), now_fn=lambda: clock[0],
+                      settle=0)
+feed.remember("CE", aligned[T0])
+n_direct = len(tk.calls)                      # calls made by the direct fetch_1m checks above
+for step in range(200):                       # ~7 minutes of 2-second polls
+    clock[0] += timedelta(seconds=2.13)
+    feed._poll_leg("CE", 1)
+check("every poll request starts on a whole minute", all(f.second == 0 for f in tk.calls))
+check("every poll reads the whole session from 09:15:00", all(f == T0 for f in tk.calls[n_direct:]))
+check("no revisions from polling the same data", revs == [])
+check("emitted candles equal the exchange candles",
+      got and all(same_ohlc(a[1], aligned[a[1].minute]) for a in got if a[1].minute in aligned))
+
+
+# ---------------------------------------------------------------- v1.3.1: last second of the minute
+# 16 Nov, SENSEX 19 Nov 82400 CE: the chart shows H/C 497.20 for 09:15, the
+# app had 493.90 because the request ended at 09:15:59. Replay that minute.
+R0 = datetime(2026, 11, 16, 9, 15)
+open_min = [(R0 + timedelta(seconds=s), p) for s, p in
+            ((0, 367.85), (12, 420.00), (31, 468.40), (58, 490.10), (59, 493.90))]
+open_min.append((R0 + timedelta(seconds=59, microseconds=600000), 497.20))
+open_min.append((R0 + timedelta(minutes=1, seconds=2), 480.00))       # 09:16 trade
+rk = _TickKite(open_min)
+ref = fetch_minute(rk, 1, R0)
+check("09:15 candle includes its last second (chart: H/C 497.20)",
+      ref is not None and ref.high == 497.20 and ref.close == 497.20)
+check("09:15 open/low unchanged", ref.open == 367.85 and ref.low == 367.85)
+check("09:16 trade not mixed into 09:15", ref.high == 497.20)
+old = [c for c in fetch_1m(rk, 1, R0, R0 + timedelta(seconds=59)) if c.minute == R0][0]
+check("old :59 request reproduces the wrong 493.90", old.close == 493.90)
+
+# a request sent at 09:15:59.9 that returns at 09:16:00.3 covers only part of
+# the minute: it must not be accepted just because the clock has moved on
+times = iter([R0 + timedelta(seconds=59, microseconds=900000),    # before the request
+              R0 + timedelta(minutes=1, microseconds=300000),     # after it returns
+              R0 + timedelta(minutes=1, seconds=1),               # next poll
+              R0 + timedelta(minutes=1, seconds=1, microseconds=200000)])
+got, revs = [], []
+f2 = RestCandleFeed(_TickKite(open_min), {"CE": 1}, R0, on_bar=lambda *a: got.append(a),
+                    on_revise=lambda *a: revs.append(a), now_fn=lambda: next(times),
+                    settle=0)
+f2._last["CE"] = R0 - timedelta(minutes=1)
+f2._poll_leg("CE", 1)
+check("minute not accepted from a request that ended inside it", got == [])
+f2._poll_leg("CE", 1)
+check("accepted once the request covers the whole minute",
+      len(got) == 1 and got[0][1].close == 497.20)
+
+
+# ---------------------------------------------------------------- v1.4: whole-session polling
+late = fetch_closed(_TickKite(ticks), 1, T0, T0 + timedelta(minutes=20, seconds=30))
+check("fetch_closed returns 09:15..09:34, not the forming 09:35",
+      late[0].minute == T0 and late[-1].minute == T0 + timedelta(minutes=19))
+check("fetch_closed candles equal the exchange candles",
+      all(same_ohlc(c, aligned[c.minute]) for c in late))
+old_k = _FakeKite()
+old_k.rows[T0] = (500, 525, 400, 510)
+old_k.rows[T0 + timedelta(minutes=1)] = (510, 515, 505, 512)
+clock = [T0 + timedelta(minutes=2, seconds=6)]
+got, revs = [], []
+f3 = RestCandleFeed(old_k, {"CE": 1}, T0, on_bar=lambda *a: got.append(a),
+                    on_revise=lambda *a: revs.append(a), now_fn=lambda: clock[0], settle=5)
+f3.remember("CE", Candle(T0, 500, 525, 400, 510))
+f3._poll_leg("CE", 1)
+clock[0] = T0 + timedelta(hours=2)                      # two hours later...
+old_k.rows[T0 + timedelta(minutes=1)] = (510, 520, 505, 511)
+f3._poll_leg("CE", 1)
+check("a revision hours later is still caught", len(revs) == 1 and revs[0][2].high == 520)
 
 
 print(f"\n{PASSED} passed, {FAILED} failed")

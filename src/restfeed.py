@@ -16,14 +16,34 @@ Rules carried over from the VWAP feed (each learned from a live failure):
   * every bar records how late it arrived; slow bars and a feed that has
     stopped delivering are logged loudly instead of failing silently
 
+v1.4 — WHOLE-SESSION POLLING, as in the SENSEX VWAP ladder (Dhan). Every
+poll asks for the full session, 09:15:00 to now, and keeps only the minutes
+that request fully covers. No sliding window, so no window edge can ever cut
+a candle. Because every poll re-reads the whole day, any candle Zerodha
+changes after we used it is still caught and logged (on_revise).
+
+v1.3.1 — END-OF-WINDOW FIX. Kite also cuts the candle at the request's `to`
+time. The 09:15 candle was requested up to 09:15:59, so trades in the last
+second were dropped (16 Nov CE: chart H/C 497.20, app 493.90). A single
+minute is now always requested up to the START of the next minute
+(fetch_minute), and the feed only treats a minute as complete if the request
+itself reached past its end.
+
+v1.3 — ALIGNMENT FIX. Kite builds the 1-minute buckets starting from the
+`from` time of the request. v1.2 asked for "now - 8 minutes", which carried
+seconds (e.g. 10:05:03), so every poll got candles cut at a different second:
+shifted OHLC, and a "revision" on almost every poll (83,000 on 16 Nov). Every
+request now starts on a whole minute (floor_minute), and fetch_1m enforces it
+for every caller.
+
 v1.2 — candles were being accepted 0.2-3 s after the minute closed and never
 looked at again. A candle served that early can still be missing the last
 trades of the minute. Now:
   * SETTLE: a candle is accepted only `settle` seconds after its minute closes
-  * VERIFY: every poll re-reads the last `verify_minutes` candles; if Zerodha
-    has changed one since we accepted it, on_revise() is called with the old
-    and new values, so the engine corrects it and the log shows exactly how
-    often and how late revisions happen
+  * VERIFY: (v1.4: the whole session, every poll) if Zerodha has changed a
+    candle since we accepted it, on_revise() is called with the old and new
+    values, so the engine corrects it and the log shows exactly how often and
+    how late revisions happen
 """
 
 import threading
@@ -55,8 +75,16 @@ def same_ohlc(a: Candle, b: Candle) -> bool:
             and abs(a.low - b.low) < 1e-6 and abs(a.close - b.close) < 1e-6)
 
 
+def floor_minute(dt: datetime) -> datetime:
+    return dt.replace(second=0, microsecond=0)
+
+
 def fetch_1m(kite, token: int, frm: datetime, to: datetime) -> List[Candle]:
-    """One REST call: 1-minute candles for token between frm and to (naive IST)."""
+    """One REST call: 1-minute candles for token between frm and to (naive IST).
+    `frm` is always floored to a whole minute: Kite aligns the candle buckets
+    to it, so a `frm` with seconds returns shifted candles."""
+    frm = floor_minute(frm)
+    to = to.replace(microsecond=0)
     rows = kite.historical_data(token, frm, to, "minute")
     out = []
     for d in rows or []:
@@ -64,6 +92,25 @@ def fetch_1m(kite, token: int, frm: datetime, to: datetime) -> List[Candle]:
         out.append(Candle(m, float(d["open"]), float(d["high"]),
                           float(d["low"]), float(d["close"])))
     return out
+
+
+def fetch_minute(kite, token: int, minute: datetime) -> Optional[Candle]:
+    """Exactly one complete 1-minute candle, e.g. the 09:15 reference.
+    The request runs to the start of the NEXT minute: ending at :59 drops
+    every trade in the minute's last second."""
+    minute = floor_minute(minute)
+    for c in fetch_1m(kite, token, minute, minute + timedelta(minutes=1)):
+        if c.minute == minute:
+            return c
+    return None
+
+
+def fetch_closed(kite, token: int, session_start: datetime, now: datetime) -> List[Candle]:
+    """Every COMPLETE 1-minute candle from session_start (09:15:00) to now.
+    A minute counts as complete only if the request itself ran past its end;
+    the minute still forming is left out."""
+    to = now.replace(microsecond=0)
+    return drop_forming(fetch_1m(kite, token, session_start, to), to)
 
 
 class RestCandleFeed:
@@ -75,7 +122,7 @@ class RestCandleFeed:
 
     def __init__(self, kite, legs: Dict[str, int], session_start: datetime,
                  on_bar: Callable, now_fn: Callable, on_revise: Optional[Callable] = None,
-                 poll: float = 2.0, settle: float = 5.0, verify_minutes: int = 5,
+                 poll: float = 2.0, settle: float = 5.0,
                  hard_deadline: float = 10.0, blind_seconds: float = 180.0,
                  late_warn: float = 20.0):
         self.kite = kite
@@ -86,7 +133,6 @@ class RestCandleFeed:
         self.now = now_fn
         self.poll = poll
         self.settle = settle
-        self.verify_minutes = verify_minutes
         self.hard_deadline = hard_deadline
         self.blind_seconds = blind_seconds
         self.late_warn = late_warn
@@ -102,6 +148,8 @@ class RestCandleFeed:
         self.abandoned = 0
         self.revisions = 0
         self.revision_ages: List[float] = []
+        self._rev_count: Dict[tuple, int] = {}
+        self._unstable_warned = set()
         self.last_bar_at = time.time()
         self.last_bar_minute: Optional[datetime] = None
         self._blind_warned = 0.0
@@ -119,8 +167,9 @@ class RestCandleFeed:
     def start(self):
         self._thread = threading.Thread(target=self._loop, daemon=True, name="restfeed")
         self._thread.start()
-        logger.info("REST candle feed started: 1-minute bars, poll %.1fs, settle %.0fs, "
-                    "re-verify last %d min", self.poll, self.settle, self.verify_minutes)
+        logger.info("REST candle feed started: full session from %s every %.1fs, "
+                    "settle %.0fs", self.session_start.strftime("%H:%M"), self.poll,
+                    self.settle)
 
     def stop(self):
         self._stop.set()
@@ -150,17 +199,13 @@ class RestCandleFeed:
             self._stop.wait(self.poll)
 
     def _poll_leg(self, side: str, token: int):
-        now = self.now()
-        frm = max(self.session_start, now - timedelta(minutes=self.verify_minutes + 3))
-        if self._last.get(side) is None:
-            frm = self.session_start
-        candles = fetch_1m(self.kite, token, frm, now)
+        # whole session every time, 09:15:00 -> now, like the VWAP ladder;
+        # only minutes the request fully covers come back (fetch_closed)
+        closed = fetch_closed(self.kite, token, self.session_start, self.now())
         self.polls += 1
         now = self.now()
-        closed = drop_forming(candles, now)            # every minute that has ended
         seen = self._seen[side]
         last = self._last.get(side)
-        verify_from = now - timedelta(minutes=self.verify_minutes + 1)
 
         for c in sorted(closed, key=lambda x: x.minute):
             if c.minute < self.session_start:
@@ -169,10 +214,17 @@ class RestCandleFeed:
 
             old = seen.get(c.minute)
             if old is not None:
-                # already accepted: re-verify recent ones
-                if c.minute >= verify_from and not same_ohlc(old, c):
+                # already accepted: re-verified on every poll
+                if not same_ohlc(old, c):
                     age = (now - close_at).total_seconds()
                     seen[c.minute] = c
+                    key = (side, c.minute)
+                    self._rev_count[key] = self._rev_count.get(key, 0) + 1
+                    if self._rev_count[key] > 3 and key not in self._unstable_warned:
+                        self._unstable_warned.add(key)
+                        logger.error("[%s] candle %s changed %d times after closing - "
+                                     "REST data is unstable, check the request window",
+                                     side, c.minute.strftime("%H:%M"), self._rev_count[key])
                     self.revisions += 1
                     self.revision_ages.append(age)
                     if self.on_revise:
@@ -195,11 +247,6 @@ class RestCandleFeed:
             self.last_bar_at = time.time()
             self.last_bar_minute = c.minute
             self.on_bar(side, c, lag, False)
-
-        # keep memory bounded
-        if len(seen) > 400:
-            for k in sorted(seen)[:-200]:
-                seen.pop(k, None)
 
     def _warn_late(self, side, c, lag):
         if lag <= self.late_warn:

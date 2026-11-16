@@ -16,9 +16,10 @@ Data split (same as the SENSEX VWAP ladder):
     REST       all candle OHLC
     WebSocket  LTP only
 
-v1.2: candles are accepted only after a settle delay and re-verified for
-several minutes; any revision Zerodha makes is applied and logged. Every
-candle used is written to logs/candles_<date>.csv for checking.
+v1.4: every poll reads the whole session from 09:15:00 (as the VWAP ladder
+does). Candles are accepted after the settle delay; any later revision by
+Zerodha is applied and logged. Every candle used is written to
+logs/candles_<date>.csv for checking.
 """
 
 import threading
@@ -31,7 +32,7 @@ import broker
 import config
 from broker import OrderRouter, Trade
 from logger import candle_row, logger, trade_row
-from restfeed import RestCandleFeed, drop_forming, fetch_1m
+from restfeed import RestCandleFeed, fetch_closed, fetch_minute
 from strategy import SideStrategy, day_high, day_low, fib_prices, pick_contract
 
 SIDES = ("CE", "PE")
@@ -229,12 +230,10 @@ class Engine:
                     idx, self.expiry, self.lot_size, self.spot, len(self._cand), win)
 
     def _ref_candle(self, token, ref_start):
-        """The 09:15 candle from REST, or None if not published yet."""
+        """The 09:15 candle from REST, or None if not published yet.
+        Requested up to 09:16:00 so the minute's last second is included."""
         try:
-            for c in fetch_1m(self.data.kite, token, ref_start,
-                              ref_start + timedelta(seconds=59)):
-                if c.minute == ref_start:
-                    return c
+            return fetch_minute(self.data.kite, token, ref_start)
         except Exception as e:
             logger.warning("historical_data %s: %s", token, e)
         return None
@@ -334,8 +333,7 @@ class Engine:
         self.feed = RestCandleFeed(
             self.data.kite, legs, ref_start, on_bar=self._on_rest_bar,
             on_revise=self._on_rest_revise, now_fn=_naive_now,
-            poll=float(self.s.get("rest_poll_seconds", 2.0)), settle=settle,
-            verify_minutes=int(self.s.get("candle_verify_minutes", 5)))
+            poll=float(self.s.get("rest_poll_seconds", 2.0)), settle=settle)
         for side in legs:
             sd = self.sides[side]
             self.feed.remember(side, sd.ref)
@@ -343,8 +341,7 @@ class Engine:
             # so the colour check never falls back to a stale candle.
             if _naive_now() > ref_start + timedelta(minutes=2):
                 try:
-                    hist = drop_forming(fetch_1m(self.data.kite, sd.token, ref_start, _naive_now()),
-                                        _naive_now(), settle)
+                    hist = fetch_closed(self.data.kite, sd.token, ref_start, _naive_now())
                     for c in hist:
                         if c.minute > ref_start:
                             sd.bars[c.minute] = c
