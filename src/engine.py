@@ -16,6 +16,12 @@ Data split (same as the SENSEX VWAP ladder):
     REST       all candle OHLC
     WebSocket  LTP only
 
+v1.4.1: Zerodha corrects a candle's close up to ~13 s after the minute ends
+(17 Nov: 19 corrections, all 7-13 s). Candles, including the 09:15 candles
+used for strike selection, are now accepted only after a 15 s settle. A later
+correction of the 09:15 open/close updates the displayed reference; levels
+change only if the high or low changes.
+
 v1.4: every poll reads the whole session from 09:15:00 (as the VWAP ladder
 does). Candles are accepted after the settle delay; any later revision by
 Zerodha is applied and logged. Every candle used is written to
@@ -382,13 +388,20 @@ class Engine:
                            "  (COLOUR CHANGED)" if flip else "")
             self._candle_log(sd, new, "REVISED", age, previous=old)
             if sd.ref is not None and new.minute == sd.ref.minute:
+                if new.high == sd.ref.high and new.low == sd.ref.low:
+                    # open/close only: levels come from H/L, so nothing to
+                    # recompute - just show the corrected candle
+                    sd.ref = new
+                    logger.info("[%s] 09:15 open/close corrected; high/low unchanged, "
+                                "levels unaffected", side)
+                    return
                 traded = any(t.side == side for t in self.trades)
                 if not traded and sd.strategy and sd.strategy.position is None:
-                    logger.warning("[%s] 09:15 reference revised before any trade: "
+                    logger.warning("[%s] 09:15 high/low revised before any trade: "
                                    "recomputing Day High / Day Low / levels", side)
                     self._apply_ref(sd, new)
                 else:
-                    logger.warning("[%s] 09:15 reference revised after trading started; "
+                    logger.warning("[%s] 09:15 high/low revised after trading started; "
                                    "levels kept as they were", side)
 
     def prev_green(self, sd, now):

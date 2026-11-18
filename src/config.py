@@ -15,7 +15,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 APP_NAME = "SENSEX Fib Breakout"
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.5.0"
 BROKER = "Zerodha"
 
 IST = ZoneInfo("Asia/Kolkata")
@@ -68,7 +68,9 @@ DEFAULT_SETTINGS = {
     # candles (REST only) — WebSocket is LTP only
     "rest_poll_seconds": 2.0,        # how often the full session (09:15 -> now) is re-read
     "bar_grace_seconds": 15.0,       # no candle for the previous minute after this -> use the last one
-    "candle_settle_seconds": 5.0,    # accept a candle only this long after its minute closes
+    "candle_settle_seconds": 6.0,    # accept a candle only this long after its minute closes
+                                     # (18 Nov test: Zerodha's candle final by +6 s at the latest;
+                                     #  any later correction is still caught and applied)
 
     # risk / orders
     "sl_points": 10.0,               # SL measured from the broken level
@@ -86,7 +88,24 @@ DEFAULT_SETTINGS = {
 
     # accounts: [{name, api_key, api_secret, lots, enabled}]
     "accounts": [],
+
+    "settings_version": 3,
 }
+
+
+def _migrate(stored: dict) -> dict:
+    """One-time upgrades of an older settings.json. Runs once per file;
+    after that the user's own choices stand."""
+    if int(stored.get("settings_version", 1)) < 2:
+        # v1.4.1: 5 s was too short (Zerodha corrects closes up to ~13 s late)
+        if float(stored.get("candle_settle_seconds", 15.0)) < 15.0:
+            stored["candle_settle_seconds"] = 15.0
+        stored["settings_version"] = 2
+    if int(stored.get("settings_version", 1)) < 3:
+        # v1.5: measured live on 18 Nov - final by +6 s; 15 s waited too long
+        stored["candle_settle_seconds"] = 6.0
+        stored["settings_version"] = 3
+    return stored
 
 
 def load_settings() -> dict:
@@ -94,8 +113,12 @@ def load_settings() -> dict:
     if SETTINGS_FILE.exists():
         try:
             stored = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+            before = int(stored.get("settings_version", 1))
+            stored = _migrate(stored)
             data.update(stored)
-        except (json.JSONDecodeError, OSError):
+            if before < data["settings_version"]:
+                save_settings(data)
+        except (json.JSONDecodeError, OSError, ValueError, TypeError):
             pass
     return data
 

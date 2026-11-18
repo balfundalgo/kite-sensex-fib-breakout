@@ -469,7 +469,7 @@ class App(ctk.CTk):
         field("REST poll (seconds)", "rest_poll_seconds",
               "re-reads the whole session from 09:15 each time")
         field("Candle settle (seconds)", "candle_settle_seconds",
-              "accept a candle only this long after its minute closes")
+              "6 recommended: Zerodha's candle is final ~6 s after the minute; later fixes are still applied")
         field("Candle grace (seconds)", "bar_grace_seconds",
               "no candle for the previous minute after this -> use the last one")
         section("Orders & risk")

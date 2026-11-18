@@ -17,7 +17,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from strategy import (Candle, SideStrategy, day_high, day_low,  # noqa: E402
                       fib_prices, pick_contract, round_down_tick)
-from restfeed import (RestCandleFeed, drop_forming, fetch_1m, fetch_closed, fetch_minute,  # noqa: E402
+from restfeed import (RestCandleFeed, drop_forming, fetch_1m, fetch_closed, fetch_minute,
+                      fetch_session, is_closed,  # noqa: E402
                       floor_minute, same_ohlc, to_ist_naive)
 
 PASSED = 0
@@ -373,6 +374,56 @@ clock[0] = T0 + timedelta(hours=2)                      # two hours later...
 old_k.rows[T0 + timedelta(minutes=1)] = (510, 520, 505, 511)
 f3._poll_leg("CE", 1)
 check("a revision hours later is still caught", len(revs) == 1 and revs[0][2].high == 520)
+
+
+# ---------------------------------------------------------------- v1.5: 6 s settle + script fetch
+# 18 Nov live (candles_live.py), 13:43 CE: first read +2 s C 137.65, final +5 s
+# H 138.65 C 138.10. A 6 s settle takes the final candle first time.
+m = T0 + timedelta(minutes=5)
+k18 = _FakeKite()
+k18.rows[m] = (132.55, 137.65, 132.15, 137.65)
+clock = [m + timedelta(minutes=1, seconds=2)]
+got, revs = [], []
+f4 = RestCandleFeed(k18, {"CE": 1}, T0, on_bar=lambda *a: got.append(a),
+                    on_revise=lambda *a: revs.append(a), now_fn=lambda: clock[0],
+                    settle=config.DEFAULT_SETTINGS["candle_settle_seconds"])
+f4._last["CE"] = m - timedelta(minutes=1)
+f4._poll_leg("CE", 1)
+check("6 s settle: not taken at +2 s", got == [])
+k18.rows[m] = (132.55, 138.65, 132.15, 138.10)            # final at +5 s
+clock[0] = m + timedelta(minutes=1, seconds=6)
+f4._poll_leg("CE", 1)
+check("6 s settle: final candle taken first time, no revision",
+      len(got) == 1 and got[0][1].high == 138.65 and got[0][1].close == 138.10 and revs == [])
+k18.rows[m] = (132.55, 138.65, 132.15, 138.20)            # a rare later fix
+clock[0] = m + timedelta(minutes=1, seconds=12)
+f4._poll_leg("CE", 1)
+check("a correction after the settle is still applied", len(revs) == 1 and revs[0][2].close == 138.20)
+check("default settle is 6 s", config.DEFAULT_SETTINGS["candle_settle_seconds"] == 6.0)
+mig = config._migrate({"candle_settle_seconds": 5.0, "mode": "PAPER"})
+check("very old settings.json ends at 6 s", mig["candle_settle_seconds"] == 6.0)
+mig = config._migrate({"candle_settle_seconds": 15.0, "settings_version": 2})
+check("v1.4.1 settings.json: 15 s moved to 6 s", mig["candle_settle_seconds"] == 6.0)
+check("migration marks the file", mig["settings_version"] == 3)
+mine = config._migrate({"candle_settle_seconds": 8.0, "settings_version": 3})
+check("a choice made after the upgrade is kept", mine["candle_settle_seconds"] == 8.0)
+
+# fetch_session is the candles_live.py request: from 09:15:00, to = now to the
+# second, forming minute returned but never treated as closed
+sk = _TickKite(ticks)
+now = T0 + timedelta(minutes=7, seconds=31, microseconds=500000)
+cs, to = fetch_session(sk, 1, T0, now)
+check("fetch_session: from 09:15:00, to now without microseconds",
+      sk.calls[-1] == T0 and to == now.replace(microsecond=0))
+check("fetch_session returns the forming 09:22", cs[-1].minute == T0 + timedelta(minutes=7))
+check("is_closed: 09:21 closed, 09:22 not",
+      is_closed(T0 + timedelta(minutes=6), to) and not is_closed(T0 + timedelta(minutes=7), to))
+check("fetch_closed = fetch_session minus the forming minute",
+      [c.minute for c in fetch_closed(sk, 1, T0, now)] == [c.minute for c in cs[:-1]])
+check("09:15 reference read by the same request equals the exchange candle",
+      same_ohlc(fetch_minute(sk, 1, T0, now), aligned[T0]))
+check("09:15 reference not returned before 09:16:00",
+      fetch_minute(sk, 1, T0, T0 + timedelta(seconds=59)) is None)
 
 
 print(f"\n{PASSED} passed, {FAILED} failed")

@@ -16,6 +16,15 @@ Rules carried over from the VWAP feed (each learned from a live failure):
   * every bar records how late it arrived; slow bars and a feed that has
     stopped delivering are logged loudly instead of failing silently
 
+v1.5 — SAME FETCH AS candles_live.py. Every candle the app uses, including
+the 09:15 reference, now comes from one function, fetch_session(), which is
+the exact request the tested candles_live.py script makes: 09:15:00 to now
+(to the second), everything Zerodha returns, then only the minutes the
+request fully covers (is_closed). 18 Nov live test: Zerodha's candle was
+final by +6 s at the latest; once final it equals the Kite chart (after a
+chart reload). Default settle is now 6 s. A candle Zerodha still corrects
+after that is caught by the re-verify and applied (on_revise).
+
 v1.4 — WHOLE-SESSION POLLING, as in the SENSEX VWAP ladder (Dhan). Every
 poll asks for the full session, 09:15:00 to now, and keeps only the minutes
 that request fully covers. No sliding window, so no window edge can ever cut
@@ -79,6 +88,28 @@ def floor_minute(dt: datetime) -> datetime:
     return dt.replace(second=0, microsecond=0)
 
 
+def fetch_session(kite, token: int, session_start: datetime, now: datetime):
+    """The request candles_live.py makes, unchanged.
+    Every candle from session_start (09:15:00) to now, INCLUDING the minute
+    still forming. Returns (candles, to); a minute m is complete only if
+    m + 60 s <= to (is_closed)."""
+    start = floor_minute(session_start)
+    to = now.replace(microsecond=0)
+    rows = kite.historical_data(token, start, to, "minute")
+    out = {}
+    for d in rows or []:
+        m = to_ist_naive(d["date"]).replace(second=0, microsecond=0)
+        if m >= start:
+            out[m] = Candle(m, float(d["open"]), float(d["high"]),
+                            float(d["low"]), float(d["close"]))
+    return [out[m] for m in sorted(out)], to
+
+
+def is_closed(minute: datetime, to: datetime) -> bool:
+    """True if a request that ended at `to` covered the whole minute."""
+    return minute + timedelta(minutes=1) <= to
+
+
 def fetch_1m(kite, token: int, frm: datetime, to: datetime) -> List[Candle]:
     """One REST call: 1-minute candles for token between frm and to (naive IST).
     `frm` is always floored to a whole minute: Kite aligns the candle buckets
@@ -94,23 +125,26 @@ def fetch_1m(kite, token: int, frm: datetime, to: datetime) -> List[Candle]:
     return out
 
 
-def fetch_minute(kite, token: int, minute: datetime) -> Optional[Candle]:
-    """Exactly one complete 1-minute candle, e.g. the 09:15 reference.
-    The request runs to the start of the NEXT minute: ending at :59 drops
-    every trade in the minute's last second."""
+def fetch_minute(kite, token: int, minute: datetime,
+                 now: Optional[datetime] = None) -> Optional[Candle]:
+    """One complete 1-minute candle, e.g. the 09:15 reference, read with the
+    same whole-session request as everything else (fetch_session from that
+    minute to now). None if the minute is not complete yet."""
     minute = floor_minute(minute)
-    for c in fetch_1m(kite, token, minute, minute + timedelta(minutes=1)):
+    if now is None:
+        now = config.now_ist().replace(tzinfo=None)
+    candles, to = fetch_session(kite, token, minute, now)
+    for c in candles:
         if c.minute == minute:
-            return c
+            return c if is_closed(minute, to) else None
     return None
 
 
 def fetch_closed(kite, token: int, session_start: datetime, now: datetime) -> List[Candle]:
-    """Every COMPLETE 1-minute candle from session_start (09:15:00) to now.
-    A minute counts as complete only if the request itself ran past its end;
+    """Every COMPLETE 1-minute candle from session_start (09:15:00) to now;
     the minute still forming is left out."""
-    to = now.replace(microsecond=0)
-    return drop_forming(fetch_1m(kite, token, session_start, to), to)
+    candles, to = fetch_session(kite, token, session_start, now)
+    return [c for c in candles if is_closed(c.minute, to)]
 
 
 class RestCandleFeed:
@@ -122,8 +156,8 @@ class RestCandleFeed:
 
     def __init__(self, kite, legs: Dict[str, int], session_start: datetime,
                  on_bar: Callable, now_fn: Callable, on_revise: Optional[Callable] = None,
-                 poll: float = 2.0, settle: float = 5.0,
-                 hard_deadline: float = 10.0, blind_seconds: float = 180.0,
+                 poll: float = 2.0, settle: float = 6.0,
+                 hard_deadline: float = 20.0, blind_seconds: float = 180.0,
                  late_warn: float = 20.0):
         self.kite = kite
         self.legs = dict(legs)                  # {"CE": token, "PE": token}

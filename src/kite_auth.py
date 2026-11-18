@@ -29,6 +29,7 @@ import config
 from logger import logger
 
 LOGIN_TIMEOUT_SEC = 300
+HTTP_TIMEOUT = 15                # seconds per REST call; Kite's default 7 s timed out on 18 Nov
 _login_lock = threading.Lock()   # one browser login at a time (one port)
 
 
@@ -88,6 +89,7 @@ def login(account: dict, host: str, port: int, force: bool = False):
         raise ValueError(f"{name}: API key / secret missing")
 
     kite = KiteConnect(api_key=api_key)
+    kite.timeout = HTTP_TIMEOUT
     path = _token_path(name)
 
     if not force and path.exists():
