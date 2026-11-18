@@ -8,6 +8,8 @@ account (qty = that account's lots x lot size).
 
 PAPER: fills at the signal LTP, nothing is sent to Zerodha.
 LIVE : MARKET buy -> wait for fill -> protective SELL stop at (level - 10).
+       v1.6: each trade carries its own exchange (BFO for SENSEX, NFO for
+       Bank Nifty), lot size and tick size, so one router serves both.
        Exits cancel the stop first; if the stop already filled, nothing else
        is sent (no double sell). All broker calls run on one worker thread so
        ticks are never blocked and orders stay in sequence.
@@ -110,7 +112,7 @@ class Leg:
 @dataclass
 class Trade:
     id: int
-    side: str
+    side: str                     # "SENSEX CE", "BANKNIFTY PE", ... (index + side)
     symbol: str
     level: float
     level_price: float
@@ -124,6 +126,14 @@ class Trade:
     exit_signal: Optional[float] = None
     reason: str = ""
     status: str = "OPEN"          # OPEN | CLOSING | CLOSED
+    exchange: str = "BFO"         # BFO (SENSEX) | NFO (BANKNIFTY)
+    lot_size: int = 0
+    tick: float = 0.05
+
+    @property
+    def filled(self):
+        """At least one account has a confirmed entry price."""
+        return any(l.entry_price is not None for l in self.legs if not l.failed)
 
     @property
     def qty(self):
@@ -169,18 +179,16 @@ def _round_tick(x, tick=0.05):
 
 
 class OrderRouter:
-    def __init__(self, settings: dict, lot_size: int, tick: float, on_trade_closed):
+    def __init__(self, settings: dict, on_trade_closed):
         self.s = settings
         self.live = settings["mode"] == "LIVE"
-        self.lot_size = lot_size
-        self.tick = tick
         self.on_trade_closed = on_trade_closed     # callback(trade)
         self.pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="orders")
         self._poll_pending = threading.Event()
 
     # -- public ---------------------------------------------------------
     def build_legs(self, trade: Trade) -> None:
-        trade.legs = [Leg(account=s.name, qty=s.lots * self.lot_size)
+        trade.legs = [Leg(account=s.name, qty=s.lots * trade.lot_size)
                       for s in active_sessions()]
 
     def enter(self, trade: Trade, ltp: float) -> None:
@@ -224,6 +232,16 @@ class OrderRouter:
         if self.live:
             self.pool.submit(self._live_move_sl, new, old)
 
+    def move_sl(self, trade: Trade, why: str = "") -> None:
+        """Move the protective stop to trade.sl (e.g. breakeven)."""
+        if not self.live:
+            for l in trade.legs:
+                if not l.failed and not l.closed:
+                    self._log(trade, l, "SELL", "STOP", None, trade.sl,
+                              f"PAPER STOP MOVED {why}".strip())
+            return
+        self.pool.submit(self._live_move_sl, trade)
+
     def poll_broker_stops(self, on_stop_filled, open_trades: list) -> None:
         """LIVE: detect protective stops that filled at the broker."""
         if not self.live or self._poll_pending.is_set():
@@ -239,11 +257,11 @@ class OrderRouter:
         sess = SESSIONS.get(account)
         return sess.kite if sess else None
 
-    def _place(self, kite, symbol, txn, qty, order_type, price=None, trigger=None):
+    def _place(self, kite, trade, txn, qty, order_type, price=None, trigger=None):
         params = dict(
             variety=kite.VARIETY_REGULAR,
-            exchange=kite.EXCHANGE_BFO,
-            tradingsymbol=symbol,
+            exchange=trade.exchange,
+            tradingsymbol=trade.symbol,
             transaction_type=txn,
             quantity=qty,
             product=self.s["product"],
@@ -278,18 +296,19 @@ class OrderRouter:
         return (last.get("status", "UNKNOWN"), last.get("average_price"),
                 last.get("status_message") or "")
 
-    def _stop_params(self, sl):
-        trigger = _round_tick(sl, self.tick)
+    def _stop_params(self, trade):
+        tick = trade.tick or 0.05
+        trigger = _round_tick(trade.sl, tick)
         if self.s["sl_order_type"] == "SL-M":
             return "SL-M", None, trigger
-        limit = max(self.tick, _round_tick(sl - float(self.s["sl_limit_buffer"]), self.tick))
+        limit = max(tick, _round_tick(trade.sl - float(self.s["sl_limit_buffer"]), tick))
         return "SL", limit, trigger
 
     def _place_stop(self, kite, trade, leg):
-        otype, limit, trigger = self._stop_params(trade.sl)
+        otype, limit, trigger = self._stop_params(trade)
         kite_type = kite.ORDER_TYPE_SLM if otype == "SL-M" else kite.ORDER_TYPE_SL
         try:
-            leg.sl_order_id = self._place(kite, trade.symbol, kite.TRANSACTION_TYPE_SELL,
+            leg.sl_order_id = self._place(kite, trade, kite.TRANSACTION_TYPE_SELL,
                                           leg.qty, kite_type, price=limit, trigger=trigger)
             self._log(trade, leg, "SELL", otype, limit, trigger, "STOP PLACED", leg.sl_order_id)
         except Exception as e:
@@ -303,7 +322,7 @@ class OrderRouter:
                 leg.failed = True
                 continue
             try:
-                oid = self._place(kite, trade.symbol, kite.TRANSACTION_TYPE_BUY,
+                oid = self._place(kite, trade, kite.TRANSACTION_TYPE_BUY,
                                   leg.qty, kite.ORDER_TYPE_MARKET)
                 leg.buy_order_id = oid
             except Exception as e:
@@ -328,9 +347,9 @@ class OrderRouter:
             for nl, ol in zip(trade.legs, old.legs):
                 nl.failed = ol.failed
                 nl.sl_order_id = ol.sl_order_id
-        otype, limit, trigger = self._stop_params(trade.sl)
+        otype, limit, trigger = self._stop_params(trade)
         for leg in trade.legs:
-            if leg.failed:
+            if leg.failed or leg.closed:
                 continue
             kite = self._kite(leg.account)
             if kite is None:
@@ -375,7 +394,7 @@ class OrderRouter:
                         continue
                     logger.warning("%s: stop cancel failed: %s", leg.account, e)
             try:
-                oid = self._place(kite, trade.symbol, kite.TRANSACTION_TYPE_SELL,
+                oid = self._place(kite, trade, kite.TRANSACTION_TYPE_SELL,
                                   leg.qty, kite.ORDER_TYPE_MARKET)
                 status, avg, msg = self._wait(kite, oid)
                 if status == "COMPLETE":

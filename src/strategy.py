@@ -18,6 +18,12 @@ Settled rules:
   * 4.618: no target, SL only, runs to square-off
   * downward breaks never trade; CE and PE are fully independent
 
+Breakeven (v1.6):
+  Once price has covered `breakeven_pct` of the way from the entry price to
+  the target (entry 500, target 600, 30 % -> at 530), the SL moves up to the
+  entry price. Once per trade; never moves the SL down; not used on 4.618
+  (no target).
+
 Candles vs ticks (v1.1):
   Candle OHLC comes ONLY from Kite's REST historical API (exact exchange
   candles). Ticks are used only for what REST cannot see inside a minute:
@@ -57,12 +63,57 @@ def round_down_tick(x: float, tick: float = 0.05) -> float:
     return round(math.floor(round(x / tick, 6)) * tick, 2)
 
 
+def round_up_tick(x: float, tick: float = 0.05) -> float:
+    return round(math.ceil(round(x / tick, 6)) * tick, 2)
+
+
 def pick_contract(cands: list, lo: float, hi: float, target: float):
     """cands: [{'premium': float, ...}]. Premium inside [lo, hi], closest to target."""
     ok = [c for c in cands if c.get("premium") and lo <= c["premium"] <= hi]
     if not ok:
         return None
     return min(ok, key=lambda c: (abs(c["premium"] - target), c["premium"]))
+
+
+def walk_to_target(n: int, start: int, close_at, target: float, cheaper: int,
+                   max_fetch: int = 20) -> dict:
+    """
+    Find the strikes whose 09:15 close sits either side of `target`.
+
+    Strikes are indexed 0..n-1 in strike order. `cheaper` is the index step
+    in which the premium falls: +1 for CE (higher strike, cheaper), -1 for PE.
+    close_at(i) returns that strike's 09:15 close, or None if it has none.
+
+    Starting at `start` (the strike whose CURRENT price is nearest the
+    target), step towards the target until the 09:15 close crosses it, then
+    check one strike beyond. Needed because after a late start the current
+    price says nothing about 09:15 (18 Nov, started 14:37: every CE strike
+    near 500 now had a 09:15 close of 600-976, the right one was never read).
+
+    Returns {index: close} for every strike read (close may be None).
+    """
+    got = {}
+
+    def get(i):
+        if 0 <= i < n and i not in got and len(got) < max_fetch:
+            got[i] = close_at(i)
+        return got.get(i)
+
+    i, direction = start, None
+    while 0 <= i < n and len(got) < max_fetch:
+        c = get(i)
+        if c is None:
+            if i not in got:
+                break                              # fetch limit reached
+            i += direction or cheaper              # no candle: keep going the same way
+            continue
+        step = cheaper if c > target else -cheaper
+        if direction is not None and step != direction:
+            get(i + direction)                     # crossed: one more beyond, for safety
+            break
+        direction = step
+        i += step
+    return got
 
 
 # ----------------------------------------------------------------------
@@ -91,6 +142,7 @@ class Position:
     sl: float
     target_level: Optional[float]
     target_price: Optional[float]
+    breakeven: bool = False      # SL already moved to entry
 
 
 @dataclass
@@ -155,7 +207,8 @@ class SideStrategy:
             if ltp <= pos.sl:
                 self.position = None
                 self.pending = None
-                return [{"kind": "EXIT", "reason": "SL", "price": ltp, "old": pos}]
+                return [{"kind": "EXIT", "reason": "BREAKEVEN SL" if pos.breakeven else "SL",
+                         "price": ltp, "old": pos}]
 
             if pos.target_price is not None and ltp >= pos.target_price:
                 crossed = self.crossed_up(prev, ltp)
@@ -219,6 +272,28 @@ class SideStrategy:
                      "reason": "price fell back below the level before the candle arrived"}]
         return [{"kind": "ENTER", "reason": f"BREAK {pd.level:g} (confirmed)", "price": ltp,
                  "position": self._open(pd.level, pd.level_price)}]
+
+    def check_breakeven(self, ltp: float, entry: Optional[float], pct: float):
+        """Move the SL to the entry price once price has covered `pct` % of the
+        way from entry to target. Returns a BREAKEVEN action, or None."""
+        pos = self.position
+        if (pos is None or pos.breakeven or pos.target_price is None or not pct
+                or pct <= 0 or entry is None or ltp is None):
+            return None
+        span = pos.target_price - entry
+        if span <= 0:
+            return None                          # filled at/above the target: nothing to protect
+        trigger = entry + span * pct / 100.0
+        if ltp < trigger:
+            return None
+        pos.breakeven = True
+        new_sl = round_up_tick(entry, self.tick)
+        if new_sl <= pos.sl:
+            return None                          # never move the SL down
+        old = pos.sl
+        pos.sl = new_sl
+        return {"kind": "BREAKEVEN", "sl": new_sl, "old_sl": old, "trigger": trigger,
+                "entry": entry, "price": ltp}
 
     def force_exit(self, reason: str, ltp: float) -> list:
         self.pending = None

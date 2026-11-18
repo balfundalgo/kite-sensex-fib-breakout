@@ -18,6 +18,16 @@ Implements *SENSEX & BANK NIFTY Automated Options Breakout + Fibonacci Strategy 
 
 CE and PE are fully independent. No trade below 0.5, no trade on downward breaks.
 
+## Index, profit target, breakeven (v1.6)
+
+| Setting | What it does |
+|---|---|
+| **Index** = SENSEX / BANKNIFTY / BOTH | SENSEX options on BFO (spot `BSE:SENSEX`), Bank Nifty options on NFO (spot `NSE:NIFTY BANK`), nearest expiry from Kite's instrument list. BOTH runs four independent contracts (SENSEX CE/PE, BANK NIFTY CE/PE). Bank Nifty has its own premium range, target, strike window and reference-candle time (`bn_` settings); each index starts trading as soon as its own reference candle is in. |
+| **Max daily profit** (₹, 0 = off) | Closed + open P/L of every index and account together. When reached, every open trade is squared off and no new entries are taken (status PROFIT DONE). |
+| **Breakeven %** (default 30, 0 = off) | Entry 500, target 600: once LTP reaches 530 the stop moves to 500 (the entry fill, rounded up to the tick). Once per trade, never lowers the stop, not used on 4.618 (no target). LIVE modifies the stop order at Zerodha. |
+
+Lots per account apply to both indices; quantity = lots × that index's lot size.
+
 ## Data: REST for candles, WebSocket for price
 
 Same split as the SENSEX VWAP ladder:

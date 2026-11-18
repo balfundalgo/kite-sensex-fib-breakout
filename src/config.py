@@ -15,7 +15,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 APP_NAME = "SENSEX Fib Breakout"
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.6.0"
 BROKER = "Zerodha"
 
 IST = ZoneInfo("Asia/Kolkata")
@@ -48,18 +48,54 @@ HL_ADJUSTMENT = 1000.0         # +1000 before the formulas, -1000 after
 
 
 # ----------------------------------------------------------------------
+# indices (Kite instrument lists)
+#   SENSEX options:     exchange BFO, name SENSEX,    spot BSE:SENSEX
+#   BANK NIFTY options: exchange NFO, name BANKNIFTY, spot NSE:NIFTY BANK
+# Contract-selection settings for Bank Nifty carry the "bn_" prefix
+# (bn_premium_min, ...); SENSEX keeps the original keys.
+# ----------------------------------------------------------------------
+INDICES = {
+    "SENSEX":    {"exchange": "BFO", "name": "SENSEX",    "spot": "BSE:SENSEX",
+                  "prefix": "",    "label": "SENSEX"},
+    "BANKNIFTY": {"exchange": "NFO", "name": "BANKNIFTY", "spot": "NSE:NIFTY BANK",
+                  "prefix": "bn_", "label": "BANK NIFTY"},
+}
+INDEX_CHOICES = ["SENSEX", "BANKNIFTY", "BOTH"]
+PER_INDEX_KEYS = ("premium_min", "premium_max", "premium_target", "strike_window",
+                  "ref_candle_time")
+
+
+def active_indices(settings: dict) -> list:
+    choice = str(settings.get("index", "SENSEX")).upper()
+    return list(INDICES) if choice == "BOTH" else [choice if choice in INDICES else "SENSEX"]
+
+
+def index_setting(settings: dict, index: str, key: str):
+    """Per-index value: SENSEX uses 'premium_min', Bank Nifty 'bn_premium_min'."""
+    return settings[INDICES[index]["prefix"] + key]
+
+
+# ----------------------------------------------------------------------
 # defaults
 # ----------------------------------------------------------------------
 DEFAULT_SETTINGS = {
     "mode": "PAPER",                 # PAPER | LIVE
-    "index": "SENSEX",               # Bank Nifty parked for now
+    "index": "SENSEX",               # SENSEX | BANKNIFTY | BOTH
 
     # contract selection
     "premium_min": 400.0,
     "premium_max": 600.0,
     "premium_target": 500.0,         # pick the premium closest to this
     "strike_window": 4000,           # +/- points around spot to scan
-    "selection_shortlist": 6,        # strikes per side whose 09:15 candle is pulled from REST
+    "selection_shortlist": 20,       # most strikes per side whose 09:15 candle is read while
+                                     # walking to the one nearest 500
+
+    # Bank Nifty contract selection (NFO); the spec leaves these configurable
+    "bn_premium_min": 400.0,
+    "bn_premium_max": 600.0,
+    "bn_premium_target": 500.0,
+    "bn_strike_window": 4000,
+    "bn_ref_candle_time": "09:15",
 
     # timing
     "ref_candle_time": "09:15",      # the 1-minute reference candle
@@ -81,6 +117,11 @@ DEFAULT_SETTINGS = {
     "roll_mode": "HOLD",             # HOLD = keep position, move SL | REORDER = sell + buy
     "max_daily_loss": 10000.0,       # rupees, per day, all accounts
     "close_on_lock": True,           # square off when the loss lock trips
+    "max_daily_profit": 0.0,         # rupees, per day, all accounts, closed + open; 0 = off.
+                                     # When reached: everything squared off, no new entries
+    "breakeven_pct": 30.0,           # move SL to entry once price has covered this % of
+                                     # entry -> target (500 entry, 600 target, 30 -> at 530);
+                                     # 0 = off. Not used on 4.618 (no target)
 
     # login callback
     "redirect_host": "127.0.0.1",
@@ -89,7 +130,7 @@ DEFAULT_SETTINGS = {
     # accounts: [{name, api_key, api_secret, lots, enabled}]
     "accounts": [],
 
-    "settings_version": 3,
+    "settings_version": 5,
 }
 
 
@@ -105,6 +146,15 @@ def _migrate(stored: dict) -> dict:
         # v1.5: measured live on 18 Nov - final by +6 s; 15 s waited too long
         stored["candle_settle_seconds"] = 6.0
         stored["settings_version"] = 3
+    if int(stored.get("settings_version", 1)) < 4:
+        # v1.5.1: strikes are now walked one by one; 6 is too few after a late start
+        if int(stored.get("selection_shortlist", 20)) < 20:
+            stored["selection_shortlist"] = 20
+        stored["settings_version"] = 4
+    if int(stored.get("settings_version", 1)) < 5:
+        # v1.6: Bank Nifty / both, max profit, breakeven - new keys come from
+        # the defaults; nothing existing changes
+        stored["settings_version"] = 5
     return stored
 
 

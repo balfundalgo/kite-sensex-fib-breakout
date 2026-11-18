@@ -160,7 +160,7 @@ class RestCandleFeed:
                  hard_deadline: float = 20.0, blind_seconds: float = 180.0,
                  late_warn: float = 20.0):
         self.kite = kite
-        self.legs = dict(legs)                  # {"CE": token, "PE": token}
+        self.legs = dict(legs)                  # {"SENSEX CE": token, ...}
         self.session_start = session_start      # today 09:15, naive IST
         self.on_bar = on_bar
         self.on_revise = on_revise
@@ -191,6 +191,12 @@ class RestCandleFeed:
         self._suppressed = 0
 
     # -- lifecycle ---------------------------------------------------------
+    def add_leg(self, name: str, token: int):
+        """Start polling another contract (v1.6: Bank Nifty legs can be added
+        after SENSEX is already trading, when their reference times differ)."""
+        self._seen.setdefault(name, {})
+        self.legs[name] = token
+
     def remember(self, side: str, c: Candle):
         """A candle already handed to the engine (reference / backfill):
         mark it accepted so it is not emitted again, but keep verifying it."""
@@ -215,7 +221,7 @@ class RestCandleFeed:
     # -- internals ---------------------------------------------------------
     def _loop(self):
         while not self._stop.is_set():
-            for side, token in self.legs.items():
+            for side, token in list(self.legs.items()):
                 if self._stop.is_set():
                     break
                 try:

@@ -23,7 +23,7 @@ jobs:
       - name: Install test dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install tzdata
+          pip install tzdata kiteconnect==5.2.2
 
       - name: Offline logic tests
         working-directory: src

@@ -3,8 +3,8 @@ gui.py
 ======
 Dashboard for the SENSEX Fib Breakout trader.
 
-Tabs: Dashboard (CE / PE panels, Fib ladders, P/L, trades), Accounts
-(Kite logins), Settings, Log. The engine runs on its own threads; the GUI
+Tabs: Dashboard (one tab per index with its CE / PE panels and Fib
+ladders, P/L, trades), Accounts (Kite logins), Settings, Log. The engine runs on its own threads; the GUI
 only reads snapshots and log lines from queues, every 300 ms.
 """
 
@@ -48,7 +48,7 @@ def fmt_pnl(x):
 
 
 class SidePanel(ctk.CTkFrame):
-    FIELDS = [("Contract", "symbol"), ("09:15 O/H/L/C (REST)", "ref"), ("Day High", "day_high"),
+    FIELDS = [("Contract", "symbol"), ("Ref O/H/L/C (REST)", "ref"), ("Day High", "day_high"),
               ("Day Low", "day_low"), ("Last candle (REST)", "last_bar"), ("LTP (WebSocket)", "ltp"),
               ("State", "state"), ("Prev candle", "prev_candle"), ("Entry", "entry"),
               ("Stop-loss", "sl"), ("Target", "target"), ("Open P/L", "pnl")]
@@ -109,7 +109,7 @@ class SidePanel(ctk.CTkFrame):
             "last_bar": d.get("last_bar") or "—",
             "entry": (f"{fmt(d.get('entry'))}  @ lvl {d['pos_level']:g}"
                       if d.get("pos_level") is not None else "—"),
-            "sl": fmt(d.get("sl")),
+            "sl": fmt(d.get("sl")) + ("  BREAKEVEN" if d.get("breakeven") else ""),
             "target": (f"{fmt(d.get('target'))}  ({d['target_level']:g})"
                        if d.get("target") else ("NONE → 15:15" if d.get("pos_level") else "—")),
             "pnl": fmt_pnl(d.get("pnl")),
@@ -203,10 +203,11 @@ class App(ctk.CTk):
         h.pack(fill="x")
         left = ctk.CTkFrame(h, fg_color="transparent")
         left.pack(side="left", padx=16, pady=10)
-        ctk.CTkLabel(left, text="SENSEX FIB BREAKOUT", font=ctk.CTkFont(size=20, weight="bold"),
+        ctk.CTkLabel(left, text="FIB BREAKOUT", font=ctk.CTkFont(size=20, weight="bold"),
                      text_color=TEXT).pack(side="left")
-        ctk.CTkLabel(left, text="  Zerodha Kite · 09:15 candle · CE / PE",
-                     text_color=SUB).pack(side="left")
+        self.lbl_index = ctk.CTkLabel(left, text="", text_color=SUB)
+        self.lbl_index.pack(side="left")
+        self._paint_index()
         self.lbl_mode = ctk.CTkLabel(left, text="", corner_radius=6,
                                      font=ctk.CTkFont(size=12, weight="bold"))
         self.lbl_mode.pack(side="left", padx=(14, 6))
@@ -242,6 +243,10 @@ class App(ctk.CTk):
         self.lbl_feed.pack(side="left")
         self._paint_mode()
 
+    def _paint_index(self):
+        names = [config.INDICES[n]["label"] for n in config.active_indices(config.SETTINGS)]
+        self.lbl_index.configure(text=f"  Zerodha Kite · {' + '.join(names)} · CE / PE")
+
     def _paint_mode(self):
         m = config.SETTINGS["mode"]
         self.lbl_mode.configure(text=f" {m} ", fg_color=WARN if m == "LIVE" else AMBER,
@@ -261,23 +266,37 @@ class App(ctk.CTk):
         self.stat = {}
         for key, title in (("pnl", "Day P/L"), ("realized", "Realized"),
                            ("unrealized", "Unrealized"), ("maxloss", "Loss lock at"),
-                           ("contract", "Expiry · Lot"), ("spot", "SENSEX")):
+                           ("maxprofit", "Profit target"), ("contract", "Expiry · Lot"),
+                           ("spot", "Spot")):
             f, v = self._stat(stats, title)
             f.pack(side="left", fill="x", expand=True, padx=4)
             self.stat[key] = v
 
+        # one view per index (CE + PE panel), switched with a slim selector
+        self.idx_view = tk.StringVar()
+        self.idx_sel = ctk.CTkSegmentedButton(
+            tab, values=[spec["label"] for spec in config.INDICES.values()],
+            variable=self.idx_view, command=self._pick_index_view,
+            selected_color=ACCENT)
+        self.idx_sel.pack(pady=(0, 6))
         mid = ctk.CTkFrame(tab, fg_color="transparent")
         mid.pack(fill="both", expand=True)
-        self.panel_ce = SidePanel(mid, "CE", CE_C)
-        self.panel_ce.pack(side="left", fill="both", expand=True, padx=4)
-        self.panel_pe = SidePanel(mid, "PE", PE_C)
-        self.panel_pe.pack(side="left", fill="both", expand=True, padx=4)
+        self.idx_frames = {}
+        self.panels = {}
+        for name, spec in config.INDICES.items():
+            f = ctk.CTkFrame(mid, fg_color="transparent")
+            self.idx_frames[spec["label"]] = f
+            for side, color in (("CE", CE_C), ("PE", PE_C)):
+                p = SidePanel(f, f"{spec['label']} {side}", color)
+                p.pack(side="left", fill="both", expand=True, padx=4)
+                self.panels[f"{name} {side}"] = p
+        self._show_index_tab()
 
         bot = ctk.CTkFrame(tab, fg_color=CARD, corner_radius=12)
         bot.pack(fill="both", expand=False, pady=(8, 0), padx=4)
         ctk.CTkLabel(bot, text="Trades today", text_color=SUB, anchor="w").pack(
             fill="x", padx=14, pady=(8, 2))
-        cols = [("id", "#", 40), ("side", "Side", 50), ("symbol", "Symbol", 190),
+        cols = [("id", "#", 40), ("side", "Side", 110), ("symbol", "Symbol", 190),
                 ("level", "Level", 60), ("et", "Entry time", 90), ("entry", "Entry", 90),
                 ("sl", "SL", 80), ("target", "Target", 90), ("xt", "Exit time", 90),
                 ("exit", "Exit", 90), ("reason", "Reason", 110), ("qty", "Qty", 60),
@@ -296,6 +315,18 @@ class App(ctk.CTk):
         self.trades.configure(yscrollcommand=sb.set)
         self.trades.pack(side="left", fill="both", expand=True)
         sb.pack(side="right", fill="y")
+
+    def _show_index_tab(self):
+        first = config.active_indices(config.SETTINGS)[0]
+        self.idx_view.set(config.INDICES[first]["label"])
+        self._pick_index_view(config.INDICES[first]["label"])
+
+    def _pick_index_view(self, label):
+        for lbl, f in self.idx_frames.items():
+            if lbl == label:
+                f.pack(fill="both", expand=True)
+            else:
+                f.pack_forget()
 
     # ------------------------------------------------------------ accounts
     def _build_accounts(self, tab):
@@ -455,15 +486,23 @@ class App(ctk.CTk):
         section("Mode")
         field("Trading mode", "mode", "PAPER simulates fills · LIVE sends real orders",
               kind="option", options=["PAPER", "LIVE"])
-        section("Contract selection")
+        field("Index", "index", "BOTH trades SENSEX and Bank Nifty side by side",
+              kind="option", options=config.INDEX_CHOICES)
+        section("SENSEX contract selection (BFO)")
         field("Premium min (₹)", "premium_min")
         field("Premium max (₹)", "premium_max")
-        field("Pick premium closest to (₹)", "premium_target", "09:15 candle close is compared")
+        field("Pick premium closest to (₹)", "premium_target", "reference candle close is compared")
         field("Strike window (± points from spot)", "strike_window")
-        field("Selection shortlist (strikes per side)", "selection_shortlist",
-              "closest by LTP; their 09:15 candle is pulled from REST")
-        section("Timing")
         field("Reference candle (HH:MM)", "ref_candle_time", "1-minute candle")
+        section("Bank Nifty contract selection (NFO)")
+        field("Premium min (₹)", "bn_premium_min")
+        field("Premium max (₹)", "bn_premium_max")
+        field("Pick premium closest to (₹)", "bn_premium_target", "reference candle close is compared")
+        field("Strike window (± points from spot)", "bn_strike_window")
+        field("Reference candle (HH:MM)", "bn_ref_candle_time", "1-minute candle")
+        section("Both indices")
+        field("Strikes checked per side (max)", "selection_shortlist",
+              "walks strike by strike to the reference close nearest the target")
         field("Square-off (HH:MM)", "squareoff_time")
         section("Candles (REST)  ·  WebSocket is used only for LTP")
         field("REST poll (seconds)", "rest_poll_seconds",
@@ -485,6 +524,10 @@ class App(ctk.CTk):
               kind="option", options=["HOLD", "REORDER"])
         field("Max daily loss (₹, all accounts)", "max_daily_loss", "0 = off")
         field("Close positions when loss lock trips", "close_on_lock", kind="bool")
+        field("Max daily profit (₹, all accounts)", "max_daily_profit",
+              "closed + open P/L; when reached everything is squared off and entries stop · 0 = off")
+        field("Breakeven at (% of the way to target)", "breakeven_pct",
+              "entry 500, target 600, 30 → SL moves to 500 once LTP reaches 530 · 0 = off")
         section("Kite login")
         field("Redirect host", "redirect_host")
         field("Redirect port", "redirect_port")
@@ -496,7 +539,9 @@ class App(ctk.CTk):
         s = config.SETTINGS
         new = {}
         numeric = {"premium_min", "premium_max", "premium_target", "strike_window",
-                   "sl_points", "sl_limit_buffer", "max_daily_loss",
+                   "bn_premium_min", "bn_premium_max", "bn_premium_target", "bn_strike_window",
+                   "sl_points", "sl_limit_buffer", "max_daily_loss", "max_daily_profit",
+                   "breakeven_pct",
                    "rest_poll_seconds", "bar_grace_seconds", "candle_settle_seconds"}
         ints = {"redirect_port", "market_protection", "selection_shortlist"}
         try:
@@ -506,14 +551,20 @@ class App(ctk.CTk):
                     val = float(val)
                 elif key in ints:
                     val = int(float(val))
-                elif key in ("ref_candle_time", "squareoff_time"):
+                elif key in ("ref_candle_time", "bn_ref_candle_time", "squareoff_time"):
                     config.parse_hhmm(val)
                 new[key] = val
         except Exception as e:
             messagebox.showerror("Settings", f"Invalid value: {e}")
             return
         if new["premium_min"] >= new["premium_max"]:
-            messagebox.showerror("Settings", "Premium min must be below premium max")
+            messagebox.showerror("Settings", "SENSEX premium min must be below premium max")
+            return
+        if new["bn_premium_min"] >= new["bn_premium_max"]:
+            messagebox.showerror("Settings", "Bank Nifty premium min must be below premium max")
+            return
+        if not 0 <= new["breakeven_pct"] < 100:
+            messagebox.showerror("Settings", "Breakeven % must be from 0 (off) to below 100")
             return
         if new["mode"] == "LIVE" and s["mode"] != "LIVE":
             if not messagebox.askyesno("LIVE mode", "LIVE sends real orders to every enabled "
@@ -522,8 +573,12 @@ class App(ctk.CTk):
         s.update(new)
         config.save_settings(s)
         self._paint_mode()
-        logger.info("Settings saved (mode %s). Strategy settings apply on the next Start; "
-                    "the loss limit applies immediately.", s["mode"])
+        if not (self.engine and self.engine.running):
+            self._paint_index()
+            self._show_index_tab()
+        logger.info("Settings saved (mode %s, index %s). Strategy settings apply on the next "
+                    "Start; max loss, max profit and breakeven apply immediately.",
+                    s["mode"], s["index"])
 
     # ------------------------------------------------------------ log
     def _build_log(self, tab):
@@ -569,7 +624,7 @@ class App(ctk.CTk):
             self.engine.resume_entries()
 
     def _unlock(self):
-        if self.engine and messagebox.askyesno("Unlock", "Release the daily loss lock?"):
+        if self.engine and messagebox.askyesno("Unlock", "Release the loss lock / profit lock?"):
             self.engine.unlock()
 
     def _on_close(self):
@@ -609,7 +664,7 @@ class App(ctk.CTk):
     def _render(self, s):
         st = s["status"]
         color = {"TRADING": OK, "LOCKED": WARN, "HALTED": WARN, "ERROR": WARN,
-                 "SQUARED OFF": ACCENT, "STOPPED": MUTED}.get(st, AMBER)
+                 "PROFIT DONE": ACCENT, "SQUARED OFF": ACCENT, "STOPPED": MUTED}.get(st, AMBER)
         self.lbl_status.configure(text=f" {st} ", fg_color=color, text_color="#111")
         rest = s.get("rest")
         if rest and rest.get("avg_lag") is not None:
@@ -638,11 +693,22 @@ class App(ctk.CTk):
         self.stat["maxloss"].configure(text=(f"-{s['max_loss']:,.0f}" if s["max_loss"] else "off")
                                        + ("  LOCKED" if s["locked"] else ""),
                                        text_color=WARN if s["locked"] else TEXT)
-        self.stat["contract"].configure(text=f"{s['expiry'] or '—'} · {s['lot_size'] or '—'}")
-        self.stat["spot"].configure(text=fmt(s["spot"]))
+        mp = s.get("max_profit") or 0
+        self.stat["maxprofit"].configure(text=(f"+{mp:,.0f}" if mp else "off")
+                                         + ("  DONE" if s.get("profit_locked") else ""),
+                                         text_color=OK if s.get("profit_locked") else TEXT)
+        idx = s.get("indices") or {}
+        short = {"SENSEX": "SNX", "BANKNIFTY": "BNF"}
+        multi = len(idx) > 1
+        self.stat["contract"].configure(text="  ".join(
+            (f"{short[n]} " if multi else "") + f"{d['expiry'] or '—'} · {d['lot_size'] or '—'}"
+            for n, d in idx.items()) or "—")
+        self.stat["spot"].configure(text="  ".join(
+            (f"{short[n]} " if multi else "") + fmt(d["spot"], 0) for n, d in idx.items()) or "—")
 
-        self.panel_ce.render(s["sides"]["CE"])
-        self.panel_pe.render(s["sides"]["PE"])
+        for key, d in s["sides"].items():
+            if key in self.panels:
+                self.panels[key].render(d)
 
         self.trades.delete(*self.trades.get_children())
         for t in reversed(s["trades"]):

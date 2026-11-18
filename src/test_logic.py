@@ -16,7 +16,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from strategy import (Candle, SideStrategy, day_high, day_low,  # noqa: E402
-                      fib_prices, pick_contract, round_down_tick)
+                      fib_prices, pick_contract, round_down_tick, walk_to_target)
 from restfeed import (RestCandleFeed, drop_forming, fetch_1m, fetch_closed, fetch_minute,
                       fetch_session, is_closed,  # noqa: E402
                       floor_minute, same_ohlc, to_ist_naive)
@@ -404,8 +404,8 @@ mig = config._migrate({"candle_settle_seconds": 5.0, "mode": "PAPER"})
 check("very old settings.json ends at 6 s", mig["candle_settle_seconds"] == 6.0)
 mig = config._migrate({"candle_settle_seconds": 15.0, "settings_version": 2})
 check("v1.4.1 settings.json: 15 s moved to 6 s", mig["candle_settle_seconds"] == 6.0)
-check("migration marks the file", mig["settings_version"] == 3)
-mine = config._migrate({"candle_settle_seconds": 8.0, "settings_version": 3})
+check("migration marks the file", mig["settings_version"] == 5)
+mine = config._migrate({"candle_settle_seconds": 8.0, "settings_version": 4})
 check("a choice made after the upgrade is kept", mine["candle_settle_seconds"] == 8.0)
 
 # fetch_session is the candles_live.py request: from 09:15:00, to = now to the
@@ -425,6 +425,176 @@ check("09:15 reference read by the same request equals the exchange candle",
 check("09:15 reference not returned before 09:16:00",
       fetch_minute(sk, 1, T0, T0 + timedelta(seconds=59)) is None)
 
+
+# ---------------------------------------------------------------- v1.5.1: strike walk
+# 18 Nov, started 14:37. CE 09:15 closes by strike (81600..82500). The CE
+# strikes nearest 500 at 14:37 were the deep ones (81600-82100), all with
+# 09:15 closes of 600+; v1.5.0 read only those and found no CE.
+ce_strikes = [81600, 81700, 81800, 81900, 82000, 82100, 82200, 82300, 82400, 82500]
+ce_close = dict(zip(ce_strikes, [976.40, 892.35, 819.75, 745.15, 670.40, 600.45,
+                                 533.80, 471.20, 412.95, 360.10]))
+reads = []
+
+
+def ce_at(i):
+    reads.append(ce_strikes[i])
+    return ce_close[ce_strikes[i]]
+
+
+got = walk_to_target(len(ce_strikes), 0, ce_at, 500, cheaper=1)
+cands = [{"sym": ce_strikes[i], "premium": c} for i, c in got.items() if c]
+check("late start: CE walk reaches 82200 / 82300", {82200, 82300} <= set(got and
+      [ce_strikes[i] for i in got]))
+check("late start: picks 82300 (471.20, nearest 500)",
+      pick_contract(cands, 400, 600, 500)["sym"] == 82300)
+check("walk stops one strike past the crossing", reads[-1] == 82400 and len(reads) == 9)
+
+reads.clear()
+got = walk_to_target(len(ce_strikes), 6, ce_at, 500, cheaper=1)       # 09:16 start at 82200
+check("09:16 start: only a few strikes read", len(reads) <= 3)
+check("09:16 start: same pick", pick_contract([{"sym": ce_strikes[i], "premium": c}
+                                               for i, c in got.items() if c],
+                                              400, 600, 500)["sym"] == 82300)
+
+# PE: premium falls as the strike goes DOWN
+pe_strikes = [82100, 82200, 82300, 82400, 82500, 82600, 82700]
+pe_close = dict(zip(pe_strikes, [263.00, 299.25, 341.00, 386.10, 435.50, 497.30, 560.00]))
+got = walk_to_target(len(pe_strikes), 0, lambda i: pe_close[pe_strikes[i]], 500, cheaper=-1)
+check("PE walk upwards from a cheap start finds 82600 (497.30)",
+      pick_contract([{"sym": pe_strikes[i], "premium": c} for i, c in got.items() if c],
+                    400, 600, 500)["sym"] == 82600)
+gaps = {0: 976.4, 1: None, 2: None, 3: 560.0, 4: 480.0, 5: 420.0}
+got = walk_to_target(6, 0, lambda i: gaps[i], 500, cheaper=1)
+check("strikes without a 09:15 candle are stepped over", 4 in got and got[4] == 480.0)
+got = walk_to_target(10, 0, lambda i: 900.0, 500, cheaper=1, max_fetch=5)
+check("walk stops at the fetch limit", len(got) == 5)
+check("v1.5.0 settings: shortlist 6 -> 20",
+      config._migrate({"selection_shortlist": 6, "settings_version": 3})["selection_shortlist"] == 20)
+
+# ---------------------------------------------------------------- v1.6: index choice
+check("index SENSEX", config.active_indices({"index": "SENSEX"}) == ["SENSEX"])
+check("index BANKNIFTY", config.active_indices({"index": "BANKNIFTY"}) == ["BANKNIFTY"])
+check("index BOTH", config.active_indices({"index": "BOTH"}) == ["SENSEX", "BANKNIFTY"])
+check("unknown index falls back to SENSEX", config.active_indices({"index": "xyz"}) == ["SENSEX"])
+check("Bank Nifty options are on NFO, spot NSE:NIFTY BANK",
+      config.INDICES["BANKNIFTY"]["exchange"] == "NFO"
+      and config.INDICES["BANKNIFTY"]["spot"] == "NSE:NIFTY BANK")
+check("SENSEX options are on BFO, spot BSE:SENSEX",
+      config.INDICES["SENSEX"]["exchange"] == "BFO" and config.INDICES["SENSEX"]["spot"] == "BSE:SENSEX")
+dflt = config.DEFAULT_SETTINGS
+check("per-index settings: SENSEX keeps the old keys",
+      config.index_setting({**dflt, "premium_min": 410.0}, "SENSEX", "premium_min") == 410.0)
+check("per-index settings: Bank Nifty uses bn_ keys",
+      config.index_setting({**dflt, "bn_premium_min": 300.0}, "BANKNIFTY", "premium_min") == 300.0)
+check("every per-index key has a Bank Nifty default",
+      all(("bn_" + k) in dflt for k in config.PER_INDEX_KEYS))
+mig = config._migrate({"selection_shortlist": 20, "settings_version": 4, "index": "SENSEX"})
+check("v1.5.1 settings.json upgrades cleanly, index kept",
+      mig["settings_version"] == 5 and mig["index"] == "SENSEX")
+check("new features default: profit target off, breakeven 30 %",
+      dflt["max_daily_profit"] == 0 and dflt["breakeven_pct"] == 30.0)
+
+
+# ---------------------------------------------------------------- v1.6: breakeven
+# levels 0.5 = 500, 0.8 = 600: entry 500, target 600, 30 % -> trigger 530
+be_levels = [(0.0, 300.0), (0.2, 400.0), (0.5, 500.0), (0.8, 600.0), (1.0, 700.0)]
+st = SideStrategy("SENSEX CE", be_levels, 10.0, 0.05)
+st.prev_ltp = 499.0
+acts = st.on_tick(501.0, True, True)
+check("entry at 0.5", acts and acts[0]["kind"] == "ENTER" and st.position.sl == 490.0)
+check("no breakeven below 530", st.check_breakeven(529.95, 500.0, 30) is None and st.position.sl == 490.0)
+be = st.check_breakeven(530.0, 500.0, 30)
+check("breakeven at 530: SL 490 -> 500", be and be["sl"] == 500.0 and st.position.sl == 500.0)
+check("breakeven fires only once", st.check_breakeven(560.0, 500.0, 30) is None)
+st.on_tick(540.0, True, True)
+acts = st.on_tick(499.0, True, True)
+check("breakeven SL exit is labelled", acts and acts[0]["reason"] == "BREAKEVEN SL")
+
+st = SideStrategy("SENSEX CE", be_levels, 10.0, 0.05)
+st.prev_ltp = 499.0
+st.on_tick(501.0, True, True)
+be = st.check_breakeven(531.0, 501.0, 30)              # real fill 501: trigger 530.7
+check("trigger measured from the fill price", be and be["sl"] == 501.0)
+st = SideStrategy("SENSEX CE", be_levels, 10.0, 0.05)
+st.prev_ltp = 499.0
+st.on_tick(501.0, True, True)
+check("breakeven off at 0 %", st.check_breakeven(590.0, 500.0, 0) is None and st.position.sl == 490.0)
+check("odd average fill rounds UP to the tick (no loss)",
+      st.check_breakeven(590.0, 500.0125, 30)["sl"] == 500.05)
+top = [(4.118, 900.0), (4.618, 1000.0)]
+st = SideStrategy("SENSEX PE", [(0.5, 800.0)] + top, 10.0, 0.05)
+st.prev_ltp = 999.0
+st.on_tick(1001.0, True, True)
+check("4.618 trade: no target, so no breakeven",
+      st.position.target_price is None and st.check_breakeven(5000.0, 1001.0, 30) is None)
+st = SideStrategy("SENSEX CE", be_levels, 10.0, 0.05)
+st.prev_ltp = 499.0
+st.on_tick(501.0, True, True)
+check("fill above the target: nothing to protect", st.check_breakeven(650.0, 605.0, 30) is None)
+# a target roll starts a fresh trade with its own breakeven
+st = SideStrategy("SENSEX CE", be_levels, 10.0, 0.05)
+st.prev_ltp = 499.0
+st.on_tick(501.0, True, True)
+st.check_breakeven(531.0, 501.0, 30)
+acts = st.on_tick(601.0, True, True)
+check("roll at target: new position, SL from the new level, breakeven reset",
+      acts[0]["kind"] == "ROLL" and st.position.sl == 590.0 and not st.position.breakeven)
+
+
+# ---------------------------------------------------------------- v1.6: router per index
+import broker  # noqa: E402
+closed = []
+rt = broker.OrderRouter({"mode": "PAPER", "product": "MIS", "sl_order_type": "SL",
+                         "sl_limit_buffer": 5.0, "market_protection": -1}, closed.append)
+broker.SESSIONS.clear()
+
+
+class _Sess:
+    def __init__(self, n, lots):
+        self.cfg = {"name": n, "lots": lots}
+        self.kite = object()
+        self.name = n
+        self.lots = lots
+        self.enabled = True
+        self.logged_in = True
+
+
+broker.SESSIONS.update({"a": _Sess("a", 2), "b": _Sess("b", 1)})
+tb = broker.Trade(id=1, side="BANKNIFTY CE", symbol="BANKNIFTY26NOV58000CE", level=0.5,
+                  level_price=500, sl=490, target_level=0.8, target_price=600,
+                  entry_time="09:20:00", signal_price=501, exchange="NFO", lot_size=30, tick=0.05)
+ts = broker.Trade(id=2, side="SENSEX CE", symbol="SENSEX26N1982300CE", level=0.5,
+                  level_price=500, sl=490, target_level=0.8, target_price=600,
+                  entry_time="09:20:00", signal_price=501, exchange="BFO", lot_size=20, tick=0.05)
+rt.enter(tb, 501)
+rt.enter(ts, 501)
+check("Bank Nifty qty uses its own lot size (2 + 1 lots x 30)", tb.qty == 90)
+check("SENSEX qty uses its own lot size (2 + 1 lots x 20)", ts.qty == 60)
+check("paper fills mark the trade filled", tb.filled and ts.filled)
+
+
+class _K:
+    VARIETY_REGULAR = "regular"
+    VALIDITY_DAY = "DAY"
+    ORDER_TYPE_MARKET = "MARKET"
+    ORDER_TYPE_SLM = "SL-M"
+
+    def __init__(self):
+        self.sent = []
+
+    def place_order(self, **kw):
+        self.sent.append(kw)
+        return "1"
+
+
+kk = _K()
+rt._place(kk, tb, "BUY", 30, "MARKET")
+rt._place(kk, ts, "BUY", 20, "MARKET")
+check("orders go to the trade's exchange (NFO / BFO)",
+      [o["exchange"] for o in kk.sent] == ["NFO", "BFO"])
+tb.sl = 501.0
+check("stop params follow the trade's SL (breakeven move)", rt._stop_params(tb)[2] == 501.0)
+broker.SESSIONS.clear()
 
 print(f"\n{PASSED} passed, {FAILED} failed")
 sys.exit(1 if FAILED else 0)

@@ -7,7 +7,7 @@ Zerodha's historical API returns now (after the day is over).
     python3 src/verify_candles.py logs/candles_2026-11-13.csv
     python3 src/verify_candles.py logs/app_2026-11-13.log
 
-Works with the v1.2 candles CSV or a v1.1/v1.2 app log.
+Works with the candles CSV or an app log, SENSEX (BFO) and Bank Nifty (NFO).
 
 What the result means:
   * every candle matches  -> the app read exactly what Zerodha serves; if the
@@ -36,11 +36,12 @@ import config  # noqa: E402
 import kite_auth  # noqa: E402
 from restfeed import fetch_1m  # noqa: E402
 
-LOG_BAR = re.compile(r"\[(CE|PE)\] (\d\d:\d\d) O ([\d.]+) H ([\d.]+) L ([\d.]+) C ([\d.]+) "
+SIDE = r"((?:SENSEX |BANKNIFTY )?(?:CE|PE))"
+LOG_BAR = re.compile(r"\[" + SIDE + r"\] (\d\d:\d\d) O ([\d.]+) H ([\d.]+) L ([\d.]+) C ([\d.]+) "
                      r"\w+\s+\(\+([\d.]+)s\)")
-LOG_REF = re.compile(r"^\S+ \S+\s+INFO\s+(CE|PE) (SENSEX\S+) \| 09:15 O ([\d.]+) H ([\d.]+) "
-                     r"L ([\d.]+) C ([\d.]+)")
-LOG_SEL = re.compile(r"(CE|PE) selected: (\S+)")
+LOG_REF = re.compile(r"^\S+ \S+\s+INFO\s+" + SIDE + r" ((?:SENSEX|BANKNIFTY)\S+) \| "
+                     r"(\d\d:\d\d) O ([\d.]+) H ([\d.]+) L ([\d.]+) C ([\d.]+)")
+LOG_SEL = re.compile(SIDE + r" selected: (\S+)")
 TOL = 0.001
 
 
@@ -56,7 +57,7 @@ def parse_log(path: Path):
         if m:
             side, sym = m.group(1), m.group(2)
             symbol[side] = sym
-            rows.append((side, sym, "09:15", *map(float, m.group(3, 4, 5, 6)), None, "REFERENCE"))
+            rows.append((side, sym, m.group(3), *map(float, m.group(4, 5, 6, 7)), None, "REFERENCE"))
             continue
         m = LOG_BAR.search(line)
         if m and m.group(1) in symbol:
@@ -105,8 +106,11 @@ def main():
     kite, _ = kite_auth.login(account, settings["redirect_host"], int(settings["redirect_port"]))
 
     symbols = sorted({r[1] for r in rows})
-    tokens = {i["tradingsymbol"]: i["instrument_token"] for i in kite.instruments("BFO")
-              if i["tradingsymbol"] in symbols}
+    tokens = {}
+    for exch in ("BFO", "NFO"):
+        if any(s.startswith("BANKNIFTY" if exch == "NFO" else "SENSEX") for s in symbols):
+            tokens.update({i["tradingsymbol"]: i["instrument_token"]
+                           for i in kite.instruments(exch) if i["tradingsymbol"] in symbols})
     final = {}
     for sym in symbols:
         if sym not in tokens:
@@ -121,7 +125,7 @@ def main():
     for r in rows:
         used[(r[1], r[2])] = r
 
-    print(f"\n{'side':4} {'min':5} {'event':9} {'read':>7}   {'app O/H/L/C':33}   "
+    print(f"\n{'side':14} {'min':5} {'event':9} {'read':>7}   {'app O/H/L/C':33}   "
           f"{'final O/H/L/C':33}  result")
     ok = bad = missing = 0
     early = []
@@ -131,7 +135,7 @@ def main():
         app = f"{o:8.2f}{h:8.2f}{l:8.2f}{c:8.2f}"
         if f is None:
             missing += 1
-            print(f"{side:4} {mn:5} {ev:9} {'':>7}   {app:33}   {'(no final candle)':33}")
+            print(f"{side:14} {mn:5} {ev:9} {'':>7}   {app:33}   {'(no final candle)':33}")
             continue
         fin = f"{f.open:8.2f}{f.high:8.2f}{f.low:8.2f}{f.close:8.2f}"
         same = all(abs(a - b) < TOL for a, b in ((o, f.open), (h, f.high), (l, f.low), (c, f.close)))
@@ -147,7 +151,7 @@ def main():
             res = "DIFF " + ",".join(diffs) + colour
             if lag is not None:
                 early.append(lag)
-        print(f"{side:4} {mn:5} {ev:9} {read:>7}   {app:33}   {fin:33}  {res}")
+        print(f"{side:14} {mn:5} {ev:9} {read:>7}   {app:33}   {fin:33}  {res}")
 
     print(f"\n{ok} match, {bad} differ, {missing} without a final candle")
     if bad and early:
